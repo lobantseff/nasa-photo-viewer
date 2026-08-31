@@ -15,6 +15,10 @@ so repeat browsing is instant and works offline.
   automatically once you zoom past it
 - Filter by sol and camera; sort newest/oldest/by capture date
 - Local caching: SQLite for metadata, disk for images, ~2 GiB LRU budget
+- Decoded textures are kept in a bounded LRU, and the images either side of
+  the selection are fetched ahead so arrow-key browsing does not stall
+- While a detail rendition loads, the gallery thumbnail stands in for it, so
+  stepping between images never lands on an empty panel
 - Works offline against anything previously browsed
 - Remembers window size and last filters
 

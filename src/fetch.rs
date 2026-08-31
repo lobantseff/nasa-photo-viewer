@@ -24,7 +24,11 @@ use crate::query::Query;
 /// Which rendition a pending image request refers to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ImageKind {
+    /// Gallery thumbnail.
     Thumbnail,
+    /// The rendition shown in the detail view.
+    Detail,
+    /// The full-resolution original.
     Full,
 }
 
@@ -56,6 +60,9 @@ pub struct Fetcher {
     tx: Sender<Update>,
     rx: Receiver<Update>,
     inflight: HashSet<String>,
+    /// Requests actually dispatched, never decremented. `inflight` drains as
+    /// work finishes, so it cannot answer "was this ever asked for".
+    issued: u64,
     online: bool,
     ctx: egui::Context,
 }
@@ -84,6 +91,7 @@ impl Fetcher {
             tx,
             rx,
             inflight: HashSet::new(),
+            issued: 0,
             online: true,
             ctx,
         })
@@ -101,6 +109,11 @@ impl Fetcher {
         self.inflight.len()
     }
 
+    /// Total requests dispatched since start.
+    pub fn issued_count(&self) -> u64 {
+        self.issued
+    }
+
     /// Read a listing page straight from cache, if it is still fresh.
     ///
     /// Lets the UI paint instantly on launch instead of waiting a round trip.
@@ -116,6 +129,7 @@ impl Fetcher {
         if !self.inflight.insert(key.clone()) {
             return;
         }
+        self.issued += 1;
 
         let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
         let (client, cache) = (Arc::clone(&self.client), Arc::clone(&self.cache));
@@ -173,6 +187,7 @@ impl Fetcher {
         if !self.inflight.insert(key.clone()) {
             return;
         }
+        self.issued += 1;
 
         let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
         let (client, cache) = (Arc::clone(&self.client), Arc::clone(&self.cache));
@@ -379,6 +394,25 @@ mod tests {
             updates.iter().any(|u| matches!(u, Update::Failed { .. })),
             "an uncached offline request must surface an error"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_issued_counter_survives_requests_completing() {
+        let dir = temp_dir("issued");
+        let cache = Cache::open_at(&dir, DEFAULT_CACHE_BUDGET).unwrap();
+        let client = Client::with_endpoint("http://127.0.0.1:1/").unwrap();
+        let mut fetcher = Fetcher::with_client(egui::Context::default(), cache, client).unwrap();
+
+        assert_eq!(fetcher.issued_count(), 0);
+        fetcher.request_listing(&Query::default(), 0);
+        assert_eq!(fetcher.issued_count(), 1);
+
+        // Draining the in-flight set must not erase the record.
+        let _ = wait_for_update(&mut fetcher);
+        assert_eq!(fetcher.inflight_count(), 0);
+        assert_eq!(fetcher.issued_count(), 1);
 
         std::fs::remove_dir_all(&dir).ok();
     }

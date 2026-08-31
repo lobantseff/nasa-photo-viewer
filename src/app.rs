@@ -1,13 +1,14 @@
 //! The eframe application: filter sidebar, thumbnail gallery, detail viewer.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
-use egui::{Color32, Key, RichText, TextureHandle, TextureOptions, Vec2};
+use egui::{Color32, Key, RichText, TextureOptions, Vec2};
 
 use crate::cache::Cache;
 use crate::fetch::{Fetcher, ImageKind, Update};
 use crate::model::{Image, ImageSize};
 use crate::query::{MARS2020_CAMERAS, MAX_PAGE_SIZE, Order, Query};
+use crate::textures::{TextureStore, Tier};
 use crate::viewer::{Gesture, ZoomPan, cursor_for, gesture_from, should_upgrade_to_full_res};
 
 const THUMB_SIZE: f32 = 150.0;
@@ -25,6 +26,27 @@ const STORAGE_KEY: &str = "npv_filters";
 ///
 /// egui's default fonts have no arrow glyphs (U+2190 and the emoji arrows all
 /// render as tofu), so this uses a guillemet, which they do provide.
+/// What the detail view managed to draw this frame.
+///
+/// Painted text is invisible to the accessibility tree, so this is what lets
+/// tests tell a stand-in apart from an empty "loading" panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DetailContent {
+    /// Nothing decoded yet: the loading panel.
+    #[default]
+    Missing,
+    /// The gallery thumbnail, held up until the real rendition lands.
+    StandIn,
+    /// The detail or full-resolution rendition.
+    Rendition,
+}
+
+/// How many images either side of the selection to fetch ahead.
+///
+/// Must stay below the detail texture budget, or stepping forward would evict
+/// the images just fetched behind.
+const PREFETCH_RADIUS: usize = 3;
+
 /// Lines a page-scroll stands for, on the rare device that reports pages.
 const PAGE_LINES: f32 = 10.0;
 
@@ -74,13 +96,14 @@ pub struct App {
     total_results: Option<u64>,
     next_page: u64,
     exhausted: bool,
-    textures: HashMap<String, TextureHandle>,
+    textures: TextureStore,
     selected: Option<usize>,
     zoom: ZoomPan,
     /// Size of the texture drawn last frame, so a resolution swap can keep the
     /// picture the same size on screen.
     shown_size: Option<Vec2>,
     full_res_pending: bool,
+    detail_content: DetailContent,
     error: Option<String>,
     serving_stale: bool,
 }
@@ -111,11 +134,12 @@ impl App {
             total_results: None,
             next_page: 0,
             exhausted: false,
-            textures: HashMap::new(),
+            textures: TextureStore::default(),
             selected: None,
             zoom: ZoomPan::default(),
             shown_size: None,
             full_res_pending: false,
+            detail_content: DetailContent::default(),
             error: None,
             serving_stale: false,
         })
@@ -192,8 +216,12 @@ impl App {
                     if kind == ImageKind::Full {
                         self.full_res_pending = false;
                     }
+                    let tier = match kind {
+                        ImageKind::Thumbnail => Tier::Thumbnail,
+                        ImageKind::Detail | ImageKind::Full => Tier::Detail,
+                    };
                     let handle = ctx.load_texture(url.clone(), *image, TextureOptions::LINEAR);
-                    self.textures.insert(url, handle);
+                    self.textures.insert(url, handle, tier);
                 }
                 Update::Failed { error, .. } => self.error = Some(error),
                 Update::Connectivity { .. } => {}
@@ -366,7 +394,7 @@ impl App {
                 // Queue thumbnails slightly beyond the viewport.
                 for idx in visible_end..prefetch_end.min(self.images.len()) {
                     if let Some(url) = self.images[idx].url_for(ImageSize::Small)
-                        && !self.textures.contains_key(url)
+                        && !self.textures.contains(url)
                     {
                         wanted.push(url.to_string());
                     }
@@ -386,7 +414,7 @@ impl App {
     }
 
     /// Draw one thumbnail; returns true when clicked.
-    fn thumb(&self, ui: &mut egui::Ui, idx: usize, wanted: &mut Vec<String>) -> bool {
+    fn thumb(&mut self, ui: &mut egui::Ui, idx: usize, wanted: &mut Vec<String>) -> bool {
         let image = &self.images[idx];
         let size = Vec2::splat(THUMB_SIZE);
         let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
@@ -401,7 +429,7 @@ impl App {
             Some(texture) => {
                 let fitted = fit(texture.size_vec2(), size);
                 let draw = egui::Rect::from_center_size(rect.center(), fitted);
-                egui::Image::new(texture).paint_at(ui, draw);
+                egui::Image::new(&texture).paint_at(ui, draw);
             }
             None => {
                 ui.painter()
@@ -451,12 +479,30 @@ impl App {
         self.zoom.reset();
         self.shown_size = None;
         self.full_res_pending = false;
-        if let Some(url) = self.images[idx].url_for(ImageSize::Large)
-            && !self.textures.contains_key(url)
-        {
-            let url = url.to_string();
-            self.fetcher.request_image(&url, ImageKind::Thumbnail);
+        self.request_detail(idx);
+        // Warm the images either side so arrow-key browsing does not wait on
+        // the network at every step.
+        for offset in 1..=PREFETCH_RADIUS {
+            if let Some(before) = idx.checked_sub(offset) {
+                self.request_detail(before);
+            }
+            self.request_detail(idx + offset);
         }
+    }
+
+    /// Request the detail rendition for `idx`, if not already decoded.
+    fn request_detail(&mut self, idx: usize) {
+        let Some(image) = self.images.get(idx) else {
+            return;
+        };
+        let Some(url) = image.url_for(ImageSize::Large) else {
+            return;
+        };
+        if self.textures.contains(url) {
+            return;
+        }
+        let url = url.to_string();
+        self.fetcher.request_image(&url, ImageKind::Detail);
     }
 
     fn step_selection(&mut self, delta: isize) {
@@ -493,7 +539,7 @@ impl App {
             if let Some(full) = full_url.clone() {
                 // Full resolution now arrives on its own once zoomed in; this
                 // only reports where that has got to.
-                if self.textures.contains_key(&full) {
+                if self.textures.contains(&full) {
                     ui.label(RichText::new("full resolution").italics());
                 } else if self.full_res_pending {
                     ui.spinner();
@@ -513,19 +559,35 @@ impl App {
 
         ui.separator();
 
-        // Prefer the full-res texture once it has arrived.
+        let small = image.url_for(ImageSize::Small).map(|s| s.to_string());
         let large = image.url_for(ImageSize::Large).map(|s| s.to_string());
         let full = image.url_for(ImageSize::FullRes).map(|s| s.to_string());
+
+        // Prefer the sharpest rendition already decoded. Falling back to the
+        // gallery thumbnail means stepping between images shows something
+        // immediately instead of an empty panel.
+        let mut stand_in = false;
         let texture = full
             .as_ref()
             .and_then(|u| self.textures.get(u))
-            .or_else(|| large.as_ref().and_then(|u| self.textures.get(u)));
+            .or_else(|| large.as_ref().and_then(|u| self.textures.get(u)))
+            .or_else(|| {
+                let thumb = small.as_ref().and_then(|u| self.textures.get(u));
+                stand_in = thumb.is_some();
+                thumb
+            });
 
         let viewport = ui.available_rect_before_wrap();
         let response = ui.allocate_rect(viewport, egui::Sense::click_and_drag());
         // A zoomed image is deliberately larger than the viewport, so all
         // painting must be clipped or it spills over the surrounding panels.
         let painter = ui.painter_at(viewport);
+
+        self.detail_content = match (&texture, stand_in) {
+            (Some(_), true) => DetailContent::StandIn,
+            (Some(_), false) => DetailContent::Rendition,
+            (None, _) => DetailContent::Missing,
+        };
 
         let Some(texture) = texture else {
             painter.text(
@@ -547,19 +609,21 @@ impl App {
         }
         self.shown_size = Some(img_size);
 
+        // A stand-in must fill the space the real image will occupy, so it is
+        // allowed to upscale past 1:1 as the real rendition would not be.
         if self.zoom.needs_fit {
-            self.zoom.fit(img_size, viewport.size());
+            self.zoom.fit(img_size, viewport.size(), stand_in);
         } else {
             // The floor moves when the window resizes or a higher-resolution
             // rendition replaces the preview.
-            self.zoom.set_bounds(img_size, viewport.size());
+            self.zoom.set_bounds(img_size, viewport.size(), stand_in);
         }
 
         // Once the preview is magnified past its own pixels it looks soft, so
         // pull the original in automatically rather than making the user ask.
         if let Some(full) = full.as_ref()
             && should_upgrade_to_full_res(self.zoom.scale, self.zoom.min_scale())
-            && !self.textures.contains_key(full)
+            && !self.textures.contains(full)
         {
             self.full_res_pending = true;
             self.fetcher.request_image(full, ImageKind::Full);
@@ -749,6 +813,14 @@ mod tests {
     use crate::viewer::MAX_SCALE;
     use egui_kittest::kittest::Queryable as _;
 
+    fn thumb_url(id: &str) -> String {
+        format!("https://x/{id}_320.jpg")
+    }
+
+    fn large_url(id: &str) -> String {
+        format!("https://x/{id}_1200.jpg")
+    }
+
     fn full_res_url(id: &str) -> String {
         format!("https://x/{id}_full.png")
     }
@@ -817,7 +889,12 @@ mod tests {
                     egui::ColorImage::from_rgba_unmultiplied([N, N], &pixels),
                     egui::TextureOptions::LINEAR,
                 );
-                app.textures.insert(url, tex);
+                let tier = if url.contains("_320") {
+                    Tier::Thumbnail
+                } else {
+                    Tier::Detail
+                };
+                app.textures.insert(url, tex, tier);
             }
         }
 
@@ -954,7 +1031,7 @@ mod tests {
 
         // Opening alone must not pull a multi-megabyte original.
         assert!(
-            !harness.state().textures.contains_key(&full),
+            !harness.state().textures.contains(&full),
             "opening an image should not fetch full resolution"
         );
 
@@ -967,7 +1044,7 @@ mod tests {
         let mut upgraded = false;
         for _ in 0..200 {
             settle(&mut harness);
-            if harness.state().textures.contains_key(&full) {
+            if harness.state().textures.contains(&full) {
                 upgraded = true;
                 break;
             }
@@ -997,6 +1074,97 @@ mod tests {
         );
         // The save action must survive the removal.
         assert!(harness.query_by_label("Save\u{2026}").is_some());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An app whose thumbnails are decoded but whose detail renditions are
+    /// not, which is the state after a plain gallery scroll.
+    fn test_app_thumbs_only(ids: &[&str]) -> (App, std::path::PathBuf) {
+        let (mut app, dir) = test_app(ids);
+        app.textures = TextureStore::default();
+
+        let ctx = egui::Context::default();
+        for id in ids {
+            let tex = ctx.load_texture(
+                thumb_url(id),
+                egui::ColorImage::from_rgba_unmultiplied([64, 64], &vec![180u8; 64 * 64 * 4]),
+                egui::TextureOptions::LINEAR,
+            );
+            app.textures.insert(thumb_url(id), tex, Tier::Thumbnail);
+        }
+        (app, dir)
+    }
+
+    #[test]
+    fn selecting_an_image_prefetches_its_neighbours() {
+        // Eight images, selecting the fourth: the window should reach three
+        // either side and stop, leaving the last untouched.
+        let (app, dir) = test_app_thumbs_only(&["A", "B", "C", "D", "E", "F", "G", "H"]);
+        let mut harness =
+            egui_kittest::Harness::new_ui_state(|ui, app: &mut App| app.ui_impl(ui), app);
+        settle(&mut harness);
+
+        // Requests drain as they fail, so count dispatches rather than
+        // whatever happens to be in flight at the moment of the assertion.
+        let before = harness.state().fetcher.issued_count();
+        harness.get_by_label("D").click();
+        settle(&mut harness);
+        let issued = harness.state().fetcher.issued_count() - before;
+
+        // A through G, and not H.
+        let expected = 1 + 2 * PREFETCH_RADIUS as u64;
+        assert_eq!(
+            issued, expected,
+            "should fetch the selection plus {PREFETCH_RADIUS} either side"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn stepping_to_a_neighbour_shows_its_thumbnail_rather_than_a_loading_screen() {
+        let (app, dir) = test_app_thumbs_only(&["A", "B", "C"]);
+        let mut harness =
+            egui_kittest::Harness::new_ui_state(|ui, app: &mut App| app.ui_impl(ui), app);
+        settle(&mut harness);
+        harness.get_by_label("B").click();
+        settle(&mut harness);
+
+        // The detail rendition is absent, so without the fallback this would
+        // be the empty "Loading image…" panel.
+        assert!(!harness.state().textures.contains(&large_url("B")));
+        assert_eq!(
+            harness.state().detail_content,
+            DetailContent::StandIn,
+            "a decoded thumbnail should stand in while the detail loads"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn browsing_many_images_does_not_grow_textures_without_bound() {
+        let ids: Vec<String> = (0..40).map(|i| format!("IMG{i:02}")).collect();
+        let refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
+        let (app, dir) = test_app(&refs);
+
+        let mut harness =
+            egui_kittest::Harness::new_ui_state(|ui, app: &mut App| app.ui_impl(ui), app);
+        settle(&mut harness);
+        harness.get_by_label("IMG00").click();
+        settle(&mut harness);
+
+        for _ in 0..39 {
+            harness.key_press(egui::Key::ArrowRight);
+            settle(&mut harness);
+        }
+
+        let details = harness.state().textures.count(Tier::Detail);
+        assert!(
+            details <= crate::textures::DEFAULT_DETAIL_CAPACITY,
+            "detail textures grew to {details}, past the budget"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
