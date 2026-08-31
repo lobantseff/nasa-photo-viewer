@@ -24,7 +24,11 @@ use crate::query::Query;
 /// Which rendition a pending image request refers to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ImageKind {
+    /// Gallery thumbnail.
     Thumbnail,
+    /// The rendition shown in the detail view.
+    Detail,
+    /// The full-resolution original.
     Full,
 }
 
@@ -49,6 +53,14 @@ pub enum Update {
     Connectivity { online: bool },
 }
 
+/// A listing served from the local cache.
+pub struct CachedListing {
+    pub images: Vec<Image>,
+    pub total_results: Option<u64>,
+    /// Past its refresh window, so a background refresh is warranted.
+    pub stale: bool,
+}
+
 pub struct Fetcher {
     rt: Runtime,
     client: Arc<Client>,
@@ -56,6 +68,9 @@ pub struct Fetcher {
     tx: Sender<Update>,
     rx: Receiver<Update>,
     inflight: HashSet<String>,
+    /// Requests actually dispatched, never decremented. `inflight` drains as
+    /// work finishes, so it cannot answer "was this ever asked for".
+    issued: u64,
     online: bool,
     ctx: egui::Context,
 }
@@ -84,6 +99,7 @@ impl Fetcher {
             tx,
             rx,
             inflight: HashSet::new(),
+            issued: 0,
             online: true,
             ctx,
         })
@@ -101,13 +117,41 @@ impl Fetcher {
         self.inflight.len()
     }
 
-    /// Read a listing page straight from cache, if it is still fresh.
+    /// Listing pages currently being fetched.
+    pub fn inflight_listings(&self) -> usize {
+        self.inflight
+            .iter()
+            .filter(|k| k.starts_with("listing:"))
+            .count()
+    }
+
+    /// Images currently being fetched or decoded.
+    pub fn inflight_images(&self) -> usize {
+        self.inflight
+            .iter()
+            .filter(|k| k.starts_with("image:"))
+            .count()
+    }
+
+    /// Total requests dispatched since start.
+    pub fn issued_count(&self) -> u64 {
+        self.issued
+    }
+
+    /// Read a listing page from cache, however old, reporting whether it is
+    /// past its refresh window.
     ///
-    /// Lets the UI paint instantly on launch instead of waiting a round trip.
-    pub fn cached_listing(&self, query: &Query, page: u64) -> Option<(Vec<Image>, Option<u64>)> {
+    /// Stale records are still perfectly good photographs. Withholding them
+    /// buys nothing and costs a blank screen for as long as the upstream
+    /// request takes, which for a cold query is many seconds.
+    pub fn cached_listing(&self, query: &Query, page: u64) -> Option<CachedListing> {
         let cache = self.cache.lock().ok()?;
-        let listing = cache.listing(query, page, false).ok().flatten()?;
-        Some((listing.images, listing.total_results))
+        let listing = cache.listing(query, page, true).ok().flatten()?;
+        Some(CachedListing {
+            images: listing.images,
+            total_results: listing.total_results,
+            stale: listing.stale,
+        })
     }
 
     /// Request a listing page unless an identical request is already running.
@@ -116,6 +160,7 @@ impl Fetcher {
         if !self.inflight.insert(key.clone()) {
             return;
         }
+        self.issued += 1;
 
         let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
         let (client, cache) = (Arc::clone(&self.client), Arc::clone(&self.cache));
@@ -173,6 +218,7 @@ impl Fetcher {
         if !self.inflight.insert(key.clone()) {
             return;
         }
+        self.issued += 1;
 
         let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
         let (client, cache) = (Arc::clone(&self.client), Arc::clone(&self.cache));
@@ -379,6 +425,45 @@ mod tests {
             updates.iter().any(|u| matches!(u, Update::Failed { .. })),
             "an uncached offline request must surface an error"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn inflight_work_is_reported_by_kind() {
+        let dir = temp_dir("kinds");
+        let cache = Cache::open_at(&dir, DEFAULT_CACHE_BUDGET).unwrap();
+        let client = Client::with_endpoint("http://127.0.0.1:1/").unwrap();
+        let mut fetcher = Fetcher::with_client(egui::Context::default(), cache, client).unwrap();
+
+        fetcher.request_listing(&Query::default(), 0);
+        fetcher.request_image("https://x/a.jpg", ImageKind::Thumbnail);
+        fetcher.request_image("https://x/b.jpg", ImageKind::Thumbnail);
+
+        // A single slow listing alongside two images must not be reported as
+        // one indistinguishable count.
+        assert_eq!(fetcher.inflight_listings(), 1);
+        assert_eq!(fetcher.inflight_images(), 2);
+        assert_eq!(fetcher.inflight_count(), 3);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_issued_counter_survives_requests_completing() {
+        let dir = temp_dir("issued");
+        let cache = Cache::open_at(&dir, DEFAULT_CACHE_BUDGET).unwrap();
+        let client = Client::with_endpoint("http://127.0.0.1:1/").unwrap();
+        let mut fetcher = Fetcher::with_client(egui::Context::default(), cache, client).unwrap();
+
+        assert_eq!(fetcher.issued_count(), 0);
+        fetcher.request_listing(&Query::default(), 0);
+        assert_eq!(fetcher.issued_count(), 1);
+
+        // Draining the in-flight set must not erase the record.
+        let _ = wait_for_update(&mut fetcher);
+        assert_eq!(fetcher.inflight_count(), 0);
+        assert_eq!(fetcher.issued_count(), 1);
 
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -59,26 +59,31 @@ impl ZoomPan {
     ///
     /// Zooming out further than "the whole image is visible" only shrinks the
     /// picture into empty space, so that is the floor. An image smaller than
-    /// the viewport stops at 1:1 instead, since blowing it up to fill the
-    /// window would only magnify its pixels.
-    pub fn min_scale_for(image: Vec2, viewport: Vec2) -> f32 {
-        Self::fit_scale(image, viewport).min(1.0)
+    /// the viewport normally stops at 1:1, since blowing it up would only
+    /// magnify its pixels.
+    ///
+    /// `allow_upscale` lifts that restriction for a low-resolution stand-in
+    /// being shown until the real rendition arrives: it has to fill the same
+    /// space the real image will, or the view would jump when it lands.
+    pub fn min_scale_for(image: Vec2, viewport: Vec2, allow_upscale: bool) -> f32 {
+        let fit = Self::fit_scale(image, viewport);
+        if allow_upscale { fit } else { fit.min(1.0) }
     }
 
     /// Recompute the zoom floor and pull the current scale up to it.
     ///
     /// Called every frame because the floor moves when the window resizes or
     /// a higher-resolution rendition replaces a preview.
-    pub fn set_bounds(&mut self, image: Vec2, viewport: Vec2) {
-        self.min_scale = Self::min_scale_for(image, viewport);
+    pub fn set_bounds(&mut self, image: Vec2, viewport: Vec2, allow_upscale: bool) {
+        self.min_scale = Self::min_scale_for(image, viewport, allow_upscale);
         if self.scale < self.min_scale {
             self.scale = self.min_scale;
         }
     }
 
     /// Fit the image to the viewport, or show it 1:1 if it is smaller.
-    pub fn fit(&mut self, image: Vec2, viewport: Vec2) {
-        self.set_bounds(image, viewport);
+    pub fn fit(&mut self, image: Vec2, viewport: Vec2, allow_upscale: bool) {
+        self.set_bounds(image, viewport, allow_upscale);
         self.scale = self.min_scale;
         self.offset = Vec2::ZERO;
         self.needs_fit = false;
@@ -249,7 +254,7 @@ mod tests {
         let vp = viewport();
         let image = vec2(2000.0, 1600.0);
         let mut zp = ZoomPan::default();
-        zp.fit(image, vp.size());
+        zp.fit(image, vp.size(), false);
 
         // Fit is the floor, so the image always fills one axis of the view.
         assert_eq!(zp.scale, 0.5);
@@ -264,12 +269,32 @@ mod tests {
     }
 
     #[test]
+    fn a_stand_in_is_allowed_to_fill_the_view() {
+        let vp = vec2(1000.0, 800.0);
+        // A 320px thumbnail held up in place of a 1200px rendition.
+        let thumb = vec2(320.0, 240.0);
+
+        let mut zp = ZoomPan::default();
+        zp.fit(thumb, vp, true);
+
+        // It must fill the space the real image will occupy, not sit tiny in
+        // the middle at 1:1.
+        assert!(
+            zp.scale > 3.0,
+            "stand-in did not fill the view: {}",
+            zp.scale
+        );
+        let shown = thumb * zp.scale;
+        assert!((shown.x - vp.x).abs() < 0.01 || (shown.y - vp.y).abs() < 0.01);
+    }
+
+    #[test]
     fn a_small_image_stops_at_one_to_one() {
         let vp = viewport();
         // Smaller than the viewport: fitting would upscale it 3x.
         let image = vec2(320.0, 240.0);
         let mut zp = ZoomPan::default();
-        zp.fit(image, vp.size());
+        zp.fit(image, vp.size(), false);
 
         assert_eq!(zp.scale, 1.0, "a small image should open at native size");
 
@@ -283,7 +308,7 @@ mod tests {
     fn zoom_in_is_still_capped() {
         let vp = viewport();
         let mut zp = ZoomPan::default();
-        zp.fit(vec2(2000.0, 1600.0), vp.size());
+        zp.fit(vec2(2000.0, 1600.0), vp.size(), false);
 
         for _ in 0..100 {
             zp.zoom_at(2.0, vp.center(), vp);
@@ -295,16 +320,16 @@ mod tests {
     fn resizing_the_window_raises_the_floor() {
         let image = vec2(2000.0, 1600.0);
         let mut zp = ZoomPan::default();
-        zp.fit(image, vec2(1000.0, 800.0));
+        zp.fit(image, vec2(1000.0, 800.0), false);
         assert_eq!(zp.scale, 0.5);
 
         // Shrinking the window lowers the fit scale; the current scale stays.
-        zp.set_bounds(image, vec2(500.0, 400.0));
+        zp.set_bounds(image, vec2(500.0, 400.0), false);
         assert_eq!(zp.min_scale(), 0.25);
         assert_eq!(zp.scale, 0.5);
 
         // Growing it raises the floor, which must pull the scale up with it.
-        zp.set_bounds(image, vec2(4000.0, 3200.0));
+        zp.set_bounds(image, vec2(4000.0, 3200.0), false);
         assert_eq!(zp.min_scale(), 1.0);
         assert_eq!(zp.scale, 1.0);
     }
@@ -314,7 +339,7 @@ mod tests {
         let vp = viewport();
         let size = vec2(1000.0, 800.0);
         let mut zp = ZoomPan::default();
-        zp.fit(size, vp.size());
+        zp.fit(size, vp.size(), false);
 
         let anchor = pos2(700.0, 300.0);
         let before = (anchor - zp.image_rect(size, vp).min) / zp.scale;
@@ -333,7 +358,7 @@ mod tests {
         let vp = viewport();
         let image = vec2(2000.0, 1600.0);
         let mut zp = ZoomPan::default();
-        zp.fit(image, vp.size());
+        zp.fit(image, vp.size(), false);
 
         zp.pan(vec2(400.0, -300.0));
         zp.clamp_to(image, vp);
@@ -347,7 +372,7 @@ mod tests {
         let vp = viewport();
         let image = vec2(2000.0, 1600.0);
         let mut zp = ZoomPan::default();
-        zp.fit(image, vp.size());
+        zp.fit(image, vp.size(), false);
         zp.zoom_at(4.0, vp.center(), vp);
 
         zp.pan(vec2(100_000.0, 100_000.0));
@@ -371,7 +396,7 @@ mod tests {
         let image = vec2(2000.0, 1600.0);
         let mut zp = ZoomPan::default();
 
-        zp.fit(image, vp);
+        zp.fit(image, vp, false);
         assert!(
             !zp.is_pannable(image, vp),
             "a fitted image has nowhere to go"
@@ -455,7 +480,7 @@ mod tests {
         let full = vec2(2400.0, 1800.0);
 
         let mut zp = ZoomPan::default();
-        zp.fit(preview, vp.size());
+        zp.fit(preview, vp.size(), false);
         zp.zoom_at(3.0, vp.center(), vp);
         let before = zp.image_rect(preview, vp);
 

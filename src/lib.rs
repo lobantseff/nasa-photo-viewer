@@ -15,6 +15,7 @@ pub mod client;
 pub mod fetch;
 pub mod model;
 pub mod query;
+pub mod textures;
 pub mod viewer;
 
 pub use app::App;
@@ -23,3 +24,4 @@ pub use client::Client;
 pub use fetch::{Fetcher, ImageKind, Update};
 pub use model::{Image, ImageListResponse, ImageSize};
 pub use query::{MARS2020_CAMERAS, MAX_PAGE_SIZE, Order, Query};
+pub use textures::{TextureStore, Tier};

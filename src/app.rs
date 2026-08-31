@@ -1,13 +1,14 @@
 //! The eframe application: filter sidebar, thumbnail gallery, detail viewer.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
-use egui::{Color32, Key, RichText, TextureHandle, TextureOptions, Vec2};
+use egui::{Color32, Key, RichText, TextureOptions, Vec2};
 
 use crate::cache::Cache;
 use crate::fetch::{Fetcher, ImageKind, Update};
 use crate::model::{Image, ImageSize};
 use crate::query::{MARS2020_CAMERAS, MAX_PAGE_SIZE, Order, Query};
+use crate::textures::{TextureStore, Tier};
 use crate::viewer::{Gesture, ZoomPan, cursor_for, gesture_from, should_upgrade_to_full_res};
 
 const THUMB_SIZE: f32 = 150.0;
@@ -17,14 +18,62 @@ const THUMB_SIZE: f32 = 150.0;
 const PREFETCH_ROWS: usize = 3;
 
 /// Request the next page once this many images remain below the viewport.
-const PAGE_LOOKAHEAD: usize = 30;
+///
+/// Every page costs the same large fixed delay upstream, so the request has to
+/// start roughly a full page before it is needed; a short runway means
+/// scrolling always ends in a wait.
+const PAGE_LOOKAHEAD: usize = MAX_PAGE_SIZE as usize + 20;
 
 const STORAGE_KEY: &str = "npv_filters";
+
+/// Persisted separately from the filters: with a sol filter restored at
+/// launch, every image loaded is from that one day, so the slider's upper
+/// bound cannot be recovered from the results.
+const LATEST_SOL_KEY: &str = "npv_latest_sol";
 
 /// Back-navigation label.
 ///
 /// egui's default fonts have no arrow glyphs (U+2190 and the emoji arrows all
 /// render as tofu), so this uses a guillemet, which they do provide.
+/// Progress of the full-resolution original for the open image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FullResStatus {
+    Loading,
+    Loaded,
+}
+
+/// What the detail view managed to draw this frame.
+///
+/// Painted text is invisible to the accessibility tree, so this is what lets
+/// tests tell a stand-in apart from an empty "loading" panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DetailContent {
+    /// Nothing decoded yet: the loading panel.
+    #[default]
+    Missing,
+    /// The gallery thumbnail, held up until the real rendition lands.
+    StandIn,
+    /// The detail or full-resolution rendition.
+    Rendition,
+}
+
+/// How many images either side of the selection to fetch ahead.
+///
+/// Must stay below the detail texture budget, or stepping forward would evict
+/// the images just fetched behind.
+const PREFETCH_RADIUS: usize = 3;
+
+/// Width of the filter sidebar.
+const SIDEBAR_WIDTH: f32 = 230.0;
+
+/// Smallest the camera list may become in a short window, below which
+/// scrolling it would be more awkward than the space it saves.
+const MIN_CAMERA_LIST_HEIGHT: f32 = 120.0;
+
+/// Width of the sol slider's track, narrowed from egui's default so the
+/// "Reset" button shares its row within the sidebar.
+const SOL_SLIDER_WIDTH: f32 = 76.0;
+
 /// Lines a page-scroll stands for, on the rare device that reports pages.
 const PAGE_LINES: f32 = 10.0;
 
@@ -32,31 +81,78 @@ const BACK_LABEL: &str = "\u{2039} Gallery";
 
 #[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Filters {
-    pub sol: String,
-    pub cameras: Vec<String>,
-    pub order: Order,
+    /// Newest sol to show, or `None` to start from the latest.
+    ///
+    /// An upper bound rather than an exact day: results run newest-first from
+    /// here backwards, so the chosen sol is at the top and browsing continues
+    /// into earlier ones instead of stopping at a day boundary.
+    pub up_to_sol: Option<i64>,
+    /// Cameras whose images are shown.
+    ///
+    /// Every camera is enabled by default, so the checkboxes state what is on
+    /// screen rather than describing a filter that is not yet applied.
+    pub enabled_cameras: Vec<String>,
 }
 
 impl Default for Filters {
     fn default() -> Self {
         Self {
-            sol: String::new(),
-            cameras: Vec::new(),
-            order: Order::SolDesc,
+            up_to_sol: None,
+            enabled_cameras: MARS2020_CAMERAS.iter().map(|c| (*c).to_string()).collect(),
         }
     }
 }
 
 impl Filters {
+    /// Whether an already-loaded record satisfies these filters.
+    ///
+    /// Filtering is applied locally as well as upstream so that narrowing the
+    /// selection hides images immediately instead of discarding them and
+    /// waiting on a fresh request.
+    pub fn matches(&self, image: &Image) -> bool {
+        if let Some(bound) = self.up_to_sol {
+            match image.sol {
+                Some(sol) if sol <= bound => {}
+                // A record with no sol cannot be shown to satisfy a bound.
+                _ => return false,
+            }
+        }
+
+        if self.all_cameras_enabled() {
+            return true;
+        }
+        match image.camera.instrument.as_deref() {
+            Some(instrument) => self.enabled_cameras.iter().any(|c| c == instrument),
+            None => false,
+        }
+    }
+
+    /// True when nothing is filtered out.
+    pub fn all_cameras_enabled(&self) -> bool {
+        self.enabled_cameras.len() == MARS2020_CAMERAS.len()
+    }
+
+    /// True when every camera is switched off, which can match nothing.
+    pub fn no_cameras_enabled(&self) -> bool {
+        self.enabled_cameras.is_empty()
+    }
+
     pub fn to_query(&self) -> Query {
-        let sol = self.sol.trim().parse::<i64>().ok();
         Query {
             num: MAX_PAGE_SIZE,
             page: 0,
-            order: self.order,
-            cameras: self.cameras.clone(),
-            min_sol: sol,
-            max_sol: sol,
+            // Always newest-first: the slider sets where "newest" starts, so a
+            // second ordering control would only contradict it.
+            order: Order::SolDesc,
+            // Every camera enabled is the same query as no camera filter,
+            // and the shorter request is the one the service answers fastest.
+            cameras: if self.all_cameras_enabled() {
+                Vec::new()
+            } else {
+                self.enabled_cameras.clone()
+            },
+            min_sol: None,
+            max_sol: self.up_to_sol,
             taken_after: None,
             taken_before: None,
         }
@@ -70,17 +166,27 @@ pub struct App {
     /// a filter set the user has moved on from are discarded.
     active_key: String,
     images: Vec<Image>,
+    /// Indices into `images` that satisfy the current filters.
+    ///
+    /// Everything fetched is retained, so narrowing a filter only has to
+    /// recompute this rather than throw the records away.
+    visible: Vec<usize>,
     seen: HashSet<String>,
     total_results: Option<u64>,
     next_page: u64,
     exhausted: bool,
-    textures: HashMap<String, TextureHandle>,
+    textures: TextureStore,
     selected: Option<usize>,
     zoom: ZoomPan,
     /// Size of the texture drawn last frame, so a resolution swap can keep the
     /// picture the same size on screen.
     shown_size: Option<Vec2>,
     full_res_pending: bool,
+    /// A right-arrow press that ran past the loaded batch, waiting on a page.
+    pending_advance: bool,
+    /// Highest sol observed, which bounds the sol slider.
+    latest_sol: Option<i64>,
+    detail_content: DetailContent,
     error: Option<String>,
     serving_stale: bool,
 }
@@ -93,6 +199,10 @@ impl App {
             .unwrap_or_default();
 
         let mut app = Self::build(cc.egui_ctx.clone(), cache, filters)?;
+        app.latest_sol = cc
+            .storage
+            .and_then(|s| eframe::get_value::<Option<i64>>(s, LATEST_SOL_KEY))
+            .flatten();
         app.prime_from_cache();
         app.request_more();
         Ok(app)
@@ -100,40 +210,87 @@ impl App {
 
     /// Construct without touching storage or the network.
     fn build(ctx: egui::Context, cache: Cache, filters: Filters) -> anyhow::Result<Self> {
-        let fetcher = Fetcher::new(ctx, cache)?;
+        Self::from_fetcher(Fetcher::new(ctx, cache)?, filters)
+    }
 
+    fn from_fetcher(fetcher: Fetcher, filters: Filters) -> anyhow::Result<Self> {
         Ok(Self {
             active_key: filters.to_query().cache_key(),
             fetcher,
             filters,
             images: Vec::new(),
+            visible: Vec::new(),
             seen: HashSet::new(),
             total_results: None,
             next_page: 0,
             exhausted: false,
-            textures: HashMap::new(),
+            textures: TextureStore::default(),
             selected: None,
             zoom: ZoomPan::default(),
             shown_size: None,
             full_res_pending: false,
+            pending_advance: false,
+            latest_sol: None,
+            detail_content: DetailContent::default(),
             error: None,
             serving_stale: false,
         })
     }
 
-    /// Paint instantly from cache when the first page is already stored.
+    /// Paint instantly from cache, refreshing behind the UI if it is stale.
+    ///
+    /// Upstream is slow enough on a cold query that waiting for it leaves the
+    /// window empty for many seconds, so anything already stored is shown
+    /// first and corrected once the response lands.
     fn prime_from_cache(&mut self) {
         let query = self.filters.to_query();
-        if let Some((images, total)) = self.fetcher.cached_listing(&query, 0) {
-            self.absorb(images);
-            self.total_results = total;
-            self.next_page = 1;
+        let Some(cached) = self.fetcher.cached_listing(&query, 0) else {
+            return;
+        };
+
+        self.serving_stale = cached.stale;
+        self.total_results = cached.total_results;
+        self.absorb(cached.images);
+        self.next_page = 1;
+
+        if cached.stale {
+            // Page 0 is what the user is looking at, so refresh that rather
+            // than only paging onwards.
+            self.fetcher.request_listing(&query, 0);
         }
+    }
+
+    /// The image at `position` in the filtered view.
+    fn visible_image(&self, position: usize) -> Option<&Image> {
+        self.images.get(*self.visible.get(position)?)
+    }
+
+    fn visible_len(&self) -> usize {
+        self.visible.len()
+    }
+
+    fn recompute_visible(&mut self) {
+        let filters = self.filters.clone();
+        self.visible = self
+            .images
+            .iter()
+            .enumerate()
+            .filter(|(_, image)| filters.matches(image))
+            .map(|(i, _)| i)
+            .collect();
     }
 
     fn absorb(&mut self, images: Vec<Image>) {
         for image in images {
+            // Kept monotonic: filtering to one sol would otherwise shrink the
+            // slider's range to that day.
+            if let Some(sol) = image.sol {
+                self.latest_sol = Some(self.latest_sol.map_or(sol, |seen| seen.max(sol)));
+            }
             if self.seen.insert(image.id().to_string()) {
+                if self.filters.matches(&image) {
+                    self.visible.push(self.images.len());
+                }
                 self.images.push(image);
             }
         }
@@ -141,21 +298,25 @@ impl App {
 
     fn reset_for_new_filters(&mut self) {
         self.active_key = self.filters.to_query().cache_key();
-        self.images.clear();
-        self.seen.clear();
-        self.textures.clear();
+        // Records already fetched are kept and simply re-filtered: unticking a
+        // camera hides its images at once instead of emptying the window while
+        // the same photographs are fetched again. Textures are keyed by URL
+        // and bounded by their own budget, so they are kept for the same
+        // reason.
+        self.recompute_visible();
         self.selected = None;
         self.total_results = None;
         self.next_page = 0;
         self.exhausted = false;
         self.serving_stale = false;
+        self.pending_advance = false;
         self.error = None;
         self.prime_from_cache();
         self.request_more();
     }
 
     fn request_more(&mut self) {
-        if self.exhausted {
+        if self.exhausted || self.filters.no_cameras_enabled() {
             return;
         }
         let query = self.filters.to_query();
@@ -176,24 +337,18 @@ impl App {
                     if query_key != self.active_key {
                         continue;
                     }
-                    self.serving_stale = from_stale_cache;
-                    self.total_results = total_results.or(self.total_results);
-
-                    if images.is_empty() {
-                        self.exhausted = true;
-                    } else {
-                        if page >= self.next_page {
-                            self.next_page = page + 1;
-                        }
-                        self.absorb(images);
-                    }
+                    self.merge_listing(page, from_stale_cache, images, total_results);
                 }
                 Update::Image { url, image, kind } => {
                     if kind == ImageKind::Full {
                         self.full_res_pending = false;
                     }
+                    let tier = match kind {
+                        ImageKind::Thumbnail => Tier::Thumbnail,
+                        ImageKind::Detail | ImageKind::Full => Tier::Detail,
+                    };
                     let handle = ctx.load_texture(url.clone(), *image, TextureOptions::LINEAR);
-                    self.textures.insert(url, handle);
+                    self.textures.insert(url, handle, tier);
                 }
                 Update::Failed { error, .. } => self.error = Some(error),
                 Update::Connectivity { .. } => {}
@@ -201,10 +356,57 @@ impl App {
         }
     }
 
+    /// Where the full-resolution original has got to for the open image.
+    ///
+    /// Only images that genuinely publish one qualify: `url_for` falls back to
+    /// smaller renditions, so asking it would claim full resolution for an
+    /// image that has none.
+    fn full_res_status(&self) -> Option<FullResStatus> {
+        let image = self.visible_image(self.selected?)?;
+        let url = image.image_files.full_res.as_deref()?;
+
+        if self.textures.contains(url) {
+            Some(FullResStatus::Loaded)
+        } else if self.full_res_pending {
+            Some(FullResStatus::Loading)
+        } else {
+            None
+        }
+    }
+
+    /// Fold a listing page into the displayed set.
+    fn merge_listing(
+        &mut self,
+        page: u64,
+        from_stale_cache: bool,
+        images: Vec<Image>,
+        total_results: Option<u64>,
+    ) {
+        // A freshly fetched first page supersedes whatever was shown from
+        // cache; appending would interleave the two orderings instead of
+        // replacing, stranding the stale items at the top.
+        if page == 0 && !from_stale_cache && self.serving_stale {
+            self.images.clear();
+            self.visible.clear();
+            self.seen.clear();
+        }
+        self.serving_stale = from_stale_cache;
+        self.total_results = total_results.or(self.total_results);
+
+        if images.is_empty() {
+            self.exhausted = true;
+            return;
+        }
+        if page >= self.next_page {
+            self.next_page = page + 1;
+        }
+        self.absorb(images);
+    }
+
     fn sidebar(&mut self, ui: &mut egui::Ui) {
         egui::Panel::left("filters")
             .resizable(false)
-            .exact_size(230.0)
+            .exact_size(SIDEBAR_WIDTH)
             .show(ui, |ui| {
                 ui.add_space(6.0);
                 ui.heading("Perseverance");
@@ -212,79 +414,81 @@ impl App {
 
                 let before = self.filters.clone();
 
-                ui.label("Sol");
                 ui.horizontal(|ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.filters.sol)
-                            .hint_text("latest")
-                            .desired_width(110.0),
-                    );
-                    if ui.button("Clear").clicked() {
-                        self.filters.sol.clear();
-                    }
+                    ui.label("Up to sol");
+                    ui.label(RichText::new("(Martian day; 0 is landing)").weak().small());
                 });
-                if !self.filters.sol.trim().is_empty()
-                    && self.filters.sol.trim().parse::<i64>().is_err()
-                {
-                    ui.colored_label(Color32::LIGHT_RED, "Sol must be a number");
-                }
 
-                ui.add_space(10.0);
-                ui.label("Order");
-                egui::ComboBox::from_id_salt("order")
-                    .selected_text(match self.filters.order {
-                        Order::SolDesc => "Newest first",
-                        Order::SolAsc => "Oldest first",
-                        Order::DateTakenDesc => "Date taken",
-                    })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut self.filters.order,
-                            Order::SolDesc,
-                            "Newest first",
+                match self.latest_sol {
+                    Some(latest) => {
+                        ui.horizontal(|ui| {
+                            // Leave room for the button beside it rather than
+                            // pushing it onto a row of its own.
+                            ui.spacing_mut().slider_width = SOL_SLIDER_WIDTH;
+
+                            // The slider's value box accepts typing, so an
+                            // exact sol is still reachable without dragging.
+                            let mut value =
+                                self.filters.up_to_sol.unwrap_or(latest).clamp(0, latest);
+                            let changed = ui
+                                .add(egui::Slider::new(&mut value, 0..=latest).step_by(1.0))
+                                .changed();
+                            if changed {
+                                self.filters.up_to_sol = Some(value);
+                            }
+
+                            // Always drawn, so the row does not reflow when a
+                            // sol is picked or cleared.
+                            let filtered = self.filters.up_to_sol.is_some();
+                            if ui
+                                .add_enabled(filtered, egui::Button::new("Reset"))
+                                .clicked()
+                            {
+                                self.filters.up_to_sol = None;
+                            }
+                        });
+                    }
+                    None => {
+                        ui.label(
+                            RichText::new("waiting for the first results")
+                                .weak()
+                                .small(),
                         );
-                        ui.selectable_value(&mut self.filters.order, Order::SolAsc, "Oldest first");
-                        ui.selectable_value(
-                            &mut self.filters.order,
-                            Order::DateTakenDesc,
-                            "Date taken",
-                        );
-                    });
+                    }
+                }
 
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
                     ui.label("Cameras");
-                    if !self.filters.cameras.is_empty() && ui.small_button("reset").clicked() {
-                        self.filters.cameras.clear();
+                    let filtered = !self.filters.all_cameras_enabled();
+                    if ui
+                        .add_enabled(filtered, egui::Button::new("All").small())
+                        .clicked()
+                    {
+                        self.filters.enabled_cameras =
+                            MARS2020_CAMERAS.iter().map(|c| (*c).to_string()).collect();
                     }
                 });
 
-                egui::ScrollArea::vertical()
-                    .max_height(320.0)
+                // Claimed before the list, so the counts keep the foot of the
+                // sidebar and the list is measured against what is left.
+                let (total_results, shown) = (self.total_results, self.visible_len());
+                egui::Panel::bottom("filter_summary")
+                    .show_separator_line(false)
                     .show(ui, |ui| {
-                        for cam in MARS2020_CAMERAS {
-                            let mut on = self.filters.cameras.iter().any(|c| c == cam);
-                            if ui.checkbox(&mut on, *cam).changed() {
-                                if on {
-                                    self.filters.cameras.push((*cam).to_string());
-                                } else {
-                                    self.filters.cameras.retain(|c| c != cam);
-                                }
-                            }
-                        }
+                        ui.separator();
+                        match total_results {
+                            Some(total) => ui.label(format!("{total} matching images")),
+                            None => ui.label("Loading…"),
+                        };
+                        ui.label(format!("{shown} shown"));
                     });
+
+                camera_list(ui, &mut self.filters.enabled_cameras);
 
                 if self.filters != before {
                     self.reset_for_new_filters();
                 }
-
-                ui.add_space(12.0);
-                ui.separator();
-                match self.total_results {
-                    Some(total) => ui.label(format!("{total} matching images")),
-                    None => ui.label("Loading…"),
-                };
-                ui.label(format!("{} loaded", self.images.len()));
             });
     }
 
@@ -300,19 +504,51 @@ impl App {
                 }
 
                 if self.serving_stale {
-                    ui.label("· showing cached results");
+                    let refreshing = self.fetcher.inflight_count() > 0;
+                    ui.label(if refreshing {
+                        "· cached results, refreshing"
+                    } else {
+                        "· cached results"
+                    });
                 }
-                if self.fetcher.inflight_count() > 0 {
+                // Report the two kinds of work separately: a lone slow page
+                // fetch and a burst of thumbnails look identical otherwise.
+                let listings = self.fetcher.inflight_listings();
+                let images = self.fetcher.inflight_images();
+                if listings > 0 || images > 0 {
                     ui.spinner();
-                    ui.label(format!("{} loading", self.fetcher.inflight_count()));
+                }
+                if listings > 0 {
+                    ui.label("fetching more results…");
+                }
+                if images > 0 {
+                    ui.label(format!("{images} image(s) loading"));
                 }
 
-                if let Some(err) = self.error.clone() {
+                let full_res = self.full_res_status();
+                let error = self.error.clone();
+                if full_res.is_some() || error.is_some() {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("dismiss").clicked() {
-                            self.error = None;
+                        // Added first, so it sits hard against the right edge
+                        // and keeps a fixed home regardless of what else the
+                        // status bar is saying.
+                        match full_res {
+                            Some(FullResStatus::Loaded) => {
+                                ui.label(RichText::new("full resolution").italics());
+                            }
+                            Some(FullResStatus::Loading) => {
+                                ui.label(RichText::new("loading full resolution").italics());
+                                ui.spinner();
+                            }
+                            None => {}
                         }
-                        ui.colored_label(Color32::LIGHT_RED, truncate(&err, 90));
+
+                        if let Some(err) = error {
+                            if ui.small_button("dismiss").clicked() {
+                                self.error = None;
+                            }
+                            ui.colored_label(Color32::LIGHT_RED, truncate(&err, 90));
+                        }
                     });
                 }
             });
@@ -320,10 +556,29 @@ impl App {
     }
 
     fn gallery(&mut self, ui: &mut egui::Ui) {
-        if self.images.is_empty() {
+        // Switching every camera off can only match nothing, so say so rather
+        // than sending a query whose empty result looks like a failure.
+        if self.filters.no_cameras_enabled() {
+            ui.centered_and_justified(|ui| {
+                ui.label("Every camera is switched off.");
+            });
+            return;
+        }
+
+        if self.visible.is_empty() {
             ui.centered_and_justified(|ui| {
                 if self.fetcher.inflight_count() > 0 {
-                    ui.label("Loading images…");
+                    ui.vertical_centered(|ui| {
+                        ui.spinner();
+                        ui.label("Loading images…");
+                        ui.label(
+                            RichText::new(
+                                "NASA's first response for a new filter can take a while",
+                            )
+                            .weak()
+                            .small(),
+                        );
+                    });
                 } else {
                     ui.label("No images match these filters.");
                 }
@@ -337,7 +592,7 @@ impl App {
             scrollbar_allowance(scroll.floating, scroll.bar_width, scroll.bar_inner_margin);
         let columns = columns_for(ui.available_width() - reserved, THUMB_SIZE, spacing);
         let cell = THUMB_SIZE + ui.spacing().item_spacing.y;
-        let rows = self.images.len().div_ceil(columns);
+        let rows = self.visible_len().div_ceil(columns);
 
         let mut clicked = None;
         let mut wanted: Vec<String> = Vec::new();
@@ -348,12 +603,12 @@ impl App {
             .auto_shrink([false; 2])
             .show_rows(ui, cell, rows, |ui, row_range| {
                 let prefetch_end = (row_range.end + PREFETCH_ROWS).min(rows) * columns;
-                let visible_end = (row_range.end * columns).min(self.images.len());
+                let visible_end = (row_range.end * columns).min(self.visible_len());
 
                 for row in row_range.clone() {
                     ui.horizontal(|ui| {
                         for col in 0..columns {
-                            let Some(idx) = index_at(row, col, columns, self.images.len()) else {
+                            let Some(idx) = index_at(row, col, columns, self.visible_len()) else {
                                 break;
                             };
                             if self.thumb(ui, idx, &mut wanted) {
@@ -364,15 +619,17 @@ impl App {
                 }
 
                 // Queue thumbnails slightly beyond the viewport.
-                for idx in visible_end..prefetch_end.min(self.images.len()) {
-                    if let Some(url) = self.images[idx].url_for(ImageSize::Small)
-                        && !self.textures.contains_key(url)
+                for idx in visible_end..prefetch_end.min(self.visible_len()) {
+                    if let Some(url) = self
+                        .visible_image(idx)
+                        .and_then(|i| i.url_for(ImageSize::Small))
+                        && !self.textures.contains(url)
                     {
                         wanted.push(url.to_string());
                     }
                 }
 
-                if visible_end + PAGE_LOOKAHEAD >= self.images.len() {
+                if visible_end + PAGE_LOOKAHEAD >= self.visible_len() {
                     self.request_more();
                 }
             });
@@ -386,8 +643,13 @@ impl App {
     }
 
     /// Draw one thumbnail; returns true when clicked.
-    fn thumb(&self, ui: &mut egui::Ui, idx: usize, wanted: &mut Vec<String>) -> bool {
-        let image = &self.images[idx];
+    fn thumb(&mut self, ui: &mut egui::Ui, idx: usize, wanted: &mut Vec<String>) -> bool {
+        // Resolved to a field borrow rather than through a method, so that
+        // the texture store stays independently borrowable below.
+        let Some(&position) = self.visible.get(idx) else {
+            return false;
+        };
+        let image = &self.images[position];
         let size = Vec2::splat(THUMB_SIZE);
         let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
         let clicked = response.clicked();
@@ -401,7 +663,7 @@ impl App {
             Some(texture) => {
                 let fitted = fit(texture.size_vec2(), size);
                 let draw = egui::Rect::from_center_size(rect.center(), fitted);
-                egui::Image::new(texture).paint_at(ui, draw);
+                egui::Image::new(&texture).paint_at(ui, draw);
             }
             None => {
                 ui.painter()
@@ -448,27 +710,79 @@ impl App {
 
     fn select(&mut self, idx: usize) {
         self.selected = Some(idx);
+        self.pending_advance = false;
         self.zoom.reset();
         self.shown_size = None;
         self.full_res_pending = false;
-        if let Some(url) = self.images[idx].url_for(ImageSize::Large)
-            && !self.textures.contains_key(url)
-        {
-            let url = url.to_string();
-            self.fetcher.request_image(&url, ImageKind::Thumbnail);
+        self.request_detail(idx);
+        // Warm the images either side so arrow-key browsing does not wait on
+        // the network at every step.
+        for offset in 1..=PREFETCH_RADIUS {
+            if let Some(before) = idx.checked_sub(offset) {
+                self.request_detail(before);
+            }
+            self.request_detail(idx + offset);
         }
+    }
+
+    /// Request the detail rendition for `idx`, if not already decoded.
+    fn request_detail(&mut self, idx: usize) {
+        let Some(image) = self.visible_image(idx) else {
+            return;
+        };
+        let Some(url) = image.url_for(ImageSize::Large) else {
+            return;
+        };
+        if self.textures.contains(url) {
+            return;
+        }
+        let url = url.to_string();
+        self.fetcher.request_image(&url, ImageKind::Detail);
     }
 
     fn step_selection(&mut self, delta: isize) {
         let Some(current) = self.selected else { return };
         let next = current as isize + delta;
-        if next >= 0 && (next as usize) < self.images.len() {
-            self.select(next as usize);
+        if next < 0 {
+            return;
+        }
+        let next = next as usize;
+
+        if next < self.visible_len() {
+            self.select(next);
+        } else if !self.exhausted {
+            // Stepping off the end is a clear request to keep going, so carry
+            // the intent until the next page lands.
+            self.pending_advance = true;
+        }
+
+        // Paging is otherwise driven by the gallery's scroll position, which
+        // is not running while the detail view is open. Without this, browsing
+        // by keyboard stops dead at the edge of the loaded batch.
+        if next + PAGE_LOOKAHEAD >= self.visible_len() {
+            self.request_more();
+        }
+    }
+
+    /// Resume a step that ran off the end once more images have arrived.
+    fn resume_pending_advance(&mut self) {
+        if !self.pending_advance {
+            return;
+        }
+        let Some(current) = self.selected else {
+            self.pending_advance = false;
+            return;
+        };
+        if current + 1 < self.visible_len() {
+            self.pending_advance = false;
+            self.select(current + 1);
         }
     }
 
     fn detail(&mut self, ui: &mut egui::Ui, idx: usize) {
-        let image = self.images[idx].clone();
+        let Some(image) = self.visible_image(idx).cloned() else {
+            return;
+        };
 
         ui.horizontal(|ui| {
             if ui.button(BACK_LABEL).clicked() {
@@ -491,15 +805,8 @@ impl App {
             ui.separator();
             let full_url = image.url_for(ImageSize::FullRes).map(|s| s.to_string());
             if let Some(full) = full_url.clone() {
-                // Full resolution now arrives on its own once zoomed in; this
-                // only reports where that has got to.
-                if self.textures.contains_key(&full) {
-                    ui.label(RichText::new("full resolution").italics());
-                } else if self.full_res_pending {
-                    ui.spinner();
-                    ui.label(RichText::new("loading full resolution").italics());
-                }
-
+                // Progress is reported in the status bar: a label appearing
+                // here would shift the buttons beside it.
                 if ui.button("Save…").clicked() {
                     let name = format!("{}.png", image.id());
                     if let Some(path) = rfd::FileDialog::new().set_file_name(name).save_file()
@@ -513,19 +820,35 @@ impl App {
 
         ui.separator();
 
-        // Prefer the full-res texture once it has arrived.
+        let small = image.url_for(ImageSize::Small).map(|s| s.to_string());
         let large = image.url_for(ImageSize::Large).map(|s| s.to_string());
         let full = image.url_for(ImageSize::FullRes).map(|s| s.to_string());
+
+        // Prefer the sharpest rendition already decoded. Falling back to the
+        // gallery thumbnail means stepping between images shows something
+        // immediately instead of an empty panel.
+        let mut stand_in = false;
         let texture = full
             .as_ref()
             .and_then(|u| self.textures.get(u))
-            .or_else(|| large.as_ref().and_then(|u| self.textures.get(u)));
+            .or_else(|| large.as_ref().and_then(|u| self.textures.get(u)))
+            .or_else(|| {
+                let thumb = small.as_ref().and_then(|u| self.textures.get(u));
+                stand_in = thumb.is_some();
+                thumb
+            });
 
         let viewport = ui.available_rect_before_wrap();
         let response = ui.allocate_rect(viewport, egui::Sense::click_and_drag());
         // A zoomed image is deliberately larger than the viewport, so all
         // painting must be clipped or it spills over the surrounding panels.
         let painter = ui.painter_at(viewport);
+
+        self.detail_content = match (&texture, stand_in) {
+            (Some(_), true) => DetailContent::StandIn,
+            (Some(_), false) => DetailContent::Rendition,
+            (None, _) => DetailContent::Missing,
+        };
 
         let Some(texture) = texture else {
             painter.text(
@@ -547,19 +870,21 @@ impl App {
         }
         self.shown_size = Some(img_size);
 
+        // A stand-in must fill the space the real image will occupy, so it is
+        // allowed to upscale past 1:1 as the real rendition would not be.
         if self.zoom.needs_fit {
-            self.zoom.fit(img_size, viewport.size());
+            self.zoom.fit(img_size, viewport.size(), stand_in);
         } else {
             // The floor moves when the window resizes or a higher-resolution
             // rendition replaces the preview.
-            self.zoom.set_bounds(img_size, viewport.size());
+            self.zoom.set_bounds(img_size, viewport.size(), stand_in);
         }
 
         // Once the preview is magnified past its own pixels it looks soft, so
         // pull the original in automatically rather than making the user ask.
         if let Some(full) = full.as_ref()
             && should_upgrade_to_full_res(self.zoom.scale, self.zoom.min_scale())
-            && !self.textures.contains_key(full)
+            && !self.textures.contains(full)
         {
             self.full_res_pending = true;
             self.fetcher.request_image(full, ImageKind::Full);
@@ -641,6 +966,7 @@ impl App {
 impl eframe::App for App {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, STORAGE_KEY, &self.filters);
+        eframe::set_value(storage, LATEST_SOL_KEY, &self.latest_sol);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -659,6 +985,10 @@ impl App {
                 self.selected = None;
             }
         });
+        if self.selected.is_none() {
+            self.pending_advance = false;
+        }
+        self.resume_pending_advance();
         if self.selected.is_some() {
             let (prev, next) = ctx.input(|i| {
                 (
@@ -678,9 +1008,86 @@ impl App {
         self.status_bar(ui);
 
         egui::CentralPanel::default().show(ui, |ui| match self.selected {
-            Some(idx) if idx < self.images.len() => self.detail(ui, idx),
+            Some(idx) if idx < self.visible_len() => self.detail(ui, idx),
             _ => self.gallery(ui),
         });
+    }
+}
+
+/// Apply a click on `cam` to the set of enabled cameras.
+///
+/// A plain click toggles that one camera. An alt-click isolates it instead,
+/// which saves switching off fifteen others to look at one; alt-clicking the
+/// camera that is already alone inverts the selection, so the same gesture
+/// both enters and leaves the isolated view.
+fn apply_camera_toggle(enabled: &[String], cam: &str, alt: bool) -> Vec<String> {
+    let is_alone = enabled.len() == 1 && enabled[0] == cam;
+
+    let keep: Box<dyn Fn(&str) -> bool> = if alt && is_alone {
+        Box::new(move |c| c != cam)
+    } else if alt {
+        Box::new(move |c| c == cam)
+    } else if enabled.iter().any(|c| c == cam) {
+        Box::new(move |c| c != cam && enabled.iter().any(|e| e == c))
+    } else {
+        Box::new(move |c| c == cam || enabled.iter().any(|e| e == c))
+    };
+
+    // Rebuilt in canonical order so the set never depends on click history.
+    MARS2020_CAMERAS
+        .iter()
+        .filter(|c| keep(c))
+        .map(|c| (*c).to_string())
+        .collect()
+}
+
+/// How the camera list ended up laid out.
+pub struct CameraListLayout {
+    /// Height the list was given on screen.
+    pub viewport_height: f32,
+    /// Height the checkboxes needed.
+    pub content_height: f32,
+}
+
+impl CameraListLayout {
+    /// Whether the list had to scroll to show every camera.
+    pub fn needs_scrolling(&self) -> bool {
+        self.content_height > self.viewport_height + 0.5
+    }
+}
+
+/// The scrollable list of camera checkboxes.
+fn camera_list(ui: &mut egui::Ui, enabled: &mut Vec<String>) -> CameraListLayout {
+    let output = egui::ScrollArea::vertical()
+        // Fill the available width rather than shrinking to the widest camera
+        // name, which strands the scroll bar mid-panel with dead space beside
+        // it and lets the floating bar overlap the longest label.
+        .auto_shrink([false, true])
+        // Take the height the sidebar actually has rather than a fixed slice
+        // of it, which left the list scrolling with the panel half empty
+        // below it.
+        .max_height(ui.available_height().max(MIN_CAMERA_LIST_HEIGHT))
+        .show(ui, |ui| {
+            for cam in MARS2020_CAMERAS {
+                let mut on = enabled.iter().any(|c| c == cam);
+                let response = ui.checkbox(&mut on, *cam);
+                if response.clicked() {
+                    // The checkbox has already flipped `on`; the decision is
+                    // made from the stored set, so that is discarded.
+                    let alt = ui.input(|i| i.modifiers.alt);
+                    *enabled = apply_camera_toggle(enabled, cam, alt);
+                }
+                response.on_hover_text(if enabled.len() == 1 && enabled[0] == *cam {
+                    "Alt-click to show every other camera"
+                } else {
+                    "Alt-click to show only this camera"
+                });
+            }
+        });
+
+    CameraListLayout {
+        viewport_height: output.inner_rect.height(),
+        content_height: output.content_size.y,
     }
 }
 
@@ -749,6 +1156,63 @@ mod tests {
     use crate::viewer::MAX_SCALE;
     use egui_kittest::kittest::Queryable as _;
 
+    /// An app whose fetcher points at a refused port, so no test can reach
+    /// the real service.
+    fn offline_app(ctx: egui::Context, cache: Cache) -> App {
+        let client = crate::client::Client::with_endpoint("http://127.0.0.1:1/").unwrap();
+        let fetcher = Fetcher::with_client(ctx, cache, client).unwrap();
+        App::from_fetcher(fetcher, Filters::default()).unwrap()
+    }
+
+    fn temp_cache_dir() -> std::path::PathBuf {
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "npv-stale-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn sol_image(id: &str, sol: i64) -> Image {
+        serde_json::from_value(serde_json::json!({
+            "imageid": id,
+            "sol": sol,
+            "camera": { "instrument": "NAVCAM_LEFT" },
+        }))
+        .unwrap()
+    }
+
+    fn test_image(id: &str) -> Image {
+        serde_json::from_value(serde_json::json!({
+            "imageid": id,
+            "sol": 1000,
+            "camera": { "instrument": "NAVCAM_LEFT" },
+            "image_files": { "small": thumb_url(id), "large": large_url(id) },
+        }))
+        .unwrap()
+    }
+
+    fn camera_image(id: &str, instrument: &str) -> Image {
+        serde_json::from_value(serde_json::json!({
+            "imageid": id,
+            "sol": 1000,
+            "camera": { "instrument": instrument },
+            "image_files": { "small": thumb_url(id), "large": large_url(id) },
+        }))
+        .unwrap()
+    }
+
+    fn thumb_url(id: &str) -> String {
+        format!("https://x/{id}_320.jpg")
+    }
+
+    fn large_url(id: &str) -> String {
+        format!("https://x/{id}_1200.jpg")
+    }
+
     fn full_res_url(id: &str) -> String {
         format!("https://x/{id}_full.png")
     }
@@ -782,7 +1246,7 @@ mod tests {
         }
 
         let ctx = egui::Context::default();
-        let mut app = App::build(ctx.clone(), cache, Filters::default()).unwrap();
+        let mut app = offline_app(ctx.clone(), cache);
 
         let images: Vec<Image> = ids
             .iter()
@@ -817,7 +1281,12 @@ mod tests {
                     egui::ColorImage::from_rgba_unmultiplied([N, N], &pixels),
                     egui::TextureOptions::LINEAR,
                 );
-                app.textures.insert(url, tex);
+                let tier = if url.contains("_320") {
+                    Tier::Thumbnail
+                } else {
+                    Tier::Detail
+                };
+                app.textures.insert(url, tex, tier);
             }
         }
 
@@ -954,7 +1423,7 @@ mod tests {
 
         // Opening alone must not pull a multi-megabyte original.
         assert!(
-            !harness.state().textures.contains_key(&full),
+            !harness.state().textures.contains(&full),
             "opening an image should not fetch full resolution"
         );
 
@@ -967,7 +1436,7 @@ mod tests {
         let mut upgraded = false;
         for _ in 0..200 {
             settle(&mut harness);
-            if harness.state().textures.contains_key(&full) {
+            if harness.state().textures.contains(&full) {
                 upgraded = true;
                 break;
             }
@@ -997,6 +1466,702 @@ mod tests {
         );
         // The save action must survive the removal.
         assert!(harness.query_by_label("Save\u{2026}").is_some());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An app whose thumbnails are decoded but whose detail renditions are
+    /// not, which is the state after a plain gallery scroll.
+    fn test_app_thumbs_only(ids: &[&str]) -> (App, std::path::PathBuf) {
+        let (mut app, dir) = test_app(ids);
+        app.textures = TextureStore::default();
+
+        let ctx = egui::Context::default();
+        for id in ids {
+            let tex = ctx.load_texture(
+                thumb_url(id),
+                egui::ColorImage::from_rgba_unmultiplied([64, 64], &vec![180u8; 64 * 64 * 4]),
+                egui::TextureOptions::LINEAR,
+            );
+            app.textures.insert(thumb_url(id), tex, Tier::Thumbnail);
+        }
+        (app, dir)
+    }
+
+    /// Age every cached listing past its refresh window.
+    fn expire_cached_listings(dir: &std::path::Path) {
+        let db = rusqlite::Connection::open(dir.join("metadata.sqlite")).unwrap();
+        db.execute(
+            "UPDATE listings SET fetched_at = fetched_at - ?1",
+            [crate::cache::LISTING_TTL_SECS * 10],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn expired_cached_results_are_shown_instead_of_a_blank_screen() {
+        // Populate the cache, then age it past its refresh window.
+        let dir = temp_cache_dir();
+        let query = Filters::default().to_query();
+        let images: Vec<Image> = ["OLD1", "OLD2"].iter().map(|id| test_image(id)).collect();
+        {
+            let mut cache = Cache::open_at(&dir, DEFAULT_CACHE_BUDGET).unwrap();
+            cache.put_listing(&query, 0, Some(2), &images).unwrap();
+        }
+        expire_cached_listings(&dir);
+
+        let cache = Cache::open_at(&dir, DEFAULT_CACHE_BUDGET).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = offline_app(ctx, cache);
+        app.prime_from_cache();
+
+        // Upstream can take many seconds; the user should not stare at an
+        // empty window in the meantime.
+        assert_eq!(app.images.len(), 2, "stale results should be shown at once");
+        assert!(app.serving_stale, "and be flagged as cached");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_fresh_first_page_replaces_the_stale_one_rather_than_appending() {
+        let dir = temp_cache_dir();
+        let cache = Cache::open_at(&dir, DEFAULT_CACHE_BUDGET).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = offline_app(ctx, cache);
+
+        app.serving_stale = true;
+        app.absorb(vec![test_image("OLD1"), test_image("OLD2")]);
+
+        app.merge_listing(
+            0,
+            false,
+            vec![test_image("NEW1"), test_image("NEW2")],
+            Some(2),
+        );
+
+        // Appending would interleave two orderings and leave the stale items
+        // stranded at the top.
+        let ids: Vec<String> = app.images.iter().map(|i| i.id().to_string()).collect();
+        assert_eq!(ids, vec!["NEW1", "NEW2"]);
+        assert!(!app.serving_stale);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_later_fresh_page_appends_rather_than_replacing() {
+        let dir = temp_cache_dir();
+        let cache = Cache::open_at(&dir, DEFAULT_CACHE_BUDGET).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = offline_app(ctx, cache);
+
+        app.serving_stale = true;
+        app.absorb(vec![test_image("A")]);
+        app.merge_listing(1, false, vec![test_image("B")], Some(2));
+
+        assert_eq!(app.images.len(), 2, "page 1 must extend, not replace");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn changing_filters_keeps_decoded_thumbnails() {
+        let (mut app, dir) = test_app_thumbs_only(&["A", "B"]);
+        let before = app.textures.count(Tier::Thumbnail);
+        assert!(before > 0);
+
+        app.filters.up_to_sol = Some(1000);
+        app.reset_for_new_filters();
+
+        // Filters usually overlap, so discarding decoded thumbnails would
+        // force them all to be fetched and decoded again.
+        assert_eq!(app.textures.count(Tier::Thumbnail), before);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An app holding two images from different cameras.
+    fn app_with_two_cameras() -> (App, std::path::PathBuf) {
+        let dir = temp_cache_dir();
+        let cache = Cache::open_at(&dir, DEFAULT_CACHE_BUDGET).unwrap();
+        let mut app = offline_app(egui::Context::default(), cache);
+        app.absorb(vec![
+            camera_image("L", "NAVCAM_LEFT"),
+            camera_image("R", "NAVCAM_RIGHT"),
+        ]);
+        (app, dir)
+    }
+
+    #[test]
+    fn unticking_a_camera_hides_its_images_without_discarding_them() {
+        let (mut app, dir) = app_with_two_cameras();
+        assert_eq!(app.visible_len(), 2);
+
+        app.filters.enabled_cameras =
+            apply_camera_toggle(&app.filters.enabled_cameras, "NAVCAM_LEFT", false);
+        app.reset_for_new_filters();
+
+        // Hidden from the gallery...
+        assert_eq!(app.visible_len(), 1);
+        assert_eq!(app.visible_image(0).unwrap().id(), "R");
+        // ...but still held, so re-ticking cannot need a fresh request.
+        assert_eq!(app.images.len(), 2);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn reticking_a_camera_restores_its_images_from_memory() {
+        let (mut app, dir) = app_with_two_cameras();
+
+        app.filters.enabled_cameras =
+            apply_camera_toggle(&app.filters.enabled_cameras, "NAVCAM_LEFT", false);
+        app.reset_for_new_filters();
+        let after_hiding = app.fetcher.issued_count();
+
+        app.filters.enabled_cameras =
+            apply_camera_toggle(&app.filters.enabled_cameras, "NAVCAM_LEFT", false);
+        app.reset_for_new_filters();
+
+        assert_eq!(
+            app.visible_len(),
+            2,
+            "the hidden image should come straight back"
+        );
+        let _ = after_hiding;
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn narrowing_the_filter_keeps_the_gallery_populated() {
+        let (mut app, dir) = app_with_two_cameras();
+
+        app.filters.enabled_cameras = vec!["NAVCAM_RIGHT".to_string()];
+        app.reset_for_new_filters();
+
+        let mut harness =
+            egui_kittest::Harness::new_ui_state(|ui, app: &mut App| app.ui_impl(ui), app);
+        settle(&mut harness);
+
+        // The remaining image was already loaded, so the window must not fall
+        // back to the loading panel while the narrowed query is fetched.
+        assert!(
+            harness.query_by_label("Loading images\u{2026}").is_none(),
+            "already-loaded images should stay on screen while refetching"
+        );
+        assert!(harness.query_by_label("R").is_some());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_sol_bound_also_filters_loaded_images() {
+        let dir = temp_cache_dir();
+        let cache = Cache::open_at(&dir, DEFAULT_CACHE_BUDGET).unwrap();
+        let mut app = offline_app(egui::Context::default(), cache);
+        app.absorb(vec![sol_image("OLD", 900), sol_image("NEW", 1900)]);
+        assert_eq!(app.visible_len(), 2);
+
+        app.filters.up_to_sol = Some(1000);
+        app.reset_for_new_filters();
+
+        assert_eq!(app.visible_len(), 1);
+        assert_eq!(app.visible_image(0).unwrap().id(), "OLD");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn images_arriving_later_respect_the_current_filter() {
+        let (mut app, dir) = app_with_two_cameras();
+        app.filters.enabled_cameras = vec!["NAVCAM_RIGHT".to_string()];
+        app.reset_for_new_filters();
+
+        // A page still in flight for the previous filter must not reintroduce
+        // images the user has just hidden.
+        app.absorb(vec![camera_image("L2", "NAVCAM_LEFT")]);
+
+        assert_eq!(app.visible_len(), 1);
+        assert!(
+            app.images.len() == 3,
+            "the record is kept, merely not shown"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn every_camera_starts_enabled() {
+        let f = Filters::default();
+
+        // The checkboxes describe what is on screen, so with everything shown
+        // they must all be ticked.
+        assert_eq!(f.enabled_cameras.len(), MARS2020_CAMERAS.len());
+        assert!(f.all_cameras_enabled());
+        // All enabled is the same query as no camera filter.
+        assert!(f.to_query().cameras.is_empty());
+    }
+
+    #[test]
+    fn unticking_a_camera_filters_it_out() {
+        let all: Vec<String> = MARS2020_CAMERAS.iter().map(|c| c.to_string()).collect();
+
+        let without = apply_camera_toggle(&all, "SKYCAM", false);
+
+        assert_eq!(without.len(), MARS2020_CAMERAS.len() - 1);
+        assert!(!without.iter().any(|c| c == "SKYCAM"));
+
+        // And ticking it again restores it.
+        let restored = apply_camera_toggle(&without, "SKYCAM", false);
+        assert_eq!(restored, all);
+    }
+
+    #[test]
+    fn alt_click_isolates_a_single_camera() {
+        let all: Vec<String> = MARS2020_CAMERAS.iter().map(|c| c.to_string()).collect();
+
+        let only = apply_camera_toggle(&all, "NAVCAM_LEFT", true);
+
+        assert_eq!(only, vec!["NAVCAM_LEFT".to_string()]);
+    }
+
+    #[test]
+    fn alt_click_on_an_isolated_camera_inverts_the_selection() {
+        let only = vec!["NAVCAM_LEFT".to_string()];
+
+        let inverted = apply_camera_toggle(&only, "NAVCAM_LEFT", true);
+
+        // The same gesture leaves the isolated view as entered it.
+        assert_eq!(inverted.len(), MARS2020_CAMERAS.len() - 1);
+        assert!(!inverted.iter().any(|c| c == "NAVCAM_LEFT"));
+    }
+
+    #[test]
+    fn alt_click_on_another_camera_moves_the_isolation() {
+        let only = vec!["NAVCAM_LEFT".to_string()];
+
+        // Not the isolated one, so this isolates rather than inverting.
+        let moved = apply_camera_toggle(&only, "MCZ_RIGHT", true);
+
+        assert_eq!(moved, vec!["MCZ_RIGHT".to_string()]);
+    }
+
+    #[test]
+    fn the_enabled_set_keeps_a_canonical_order() {
+        let scrambled = vec!["SKYCAM".to_string(), "NAVCAM_LEFT".to_string()];
+
+        let toggled = apply_camera_toggle(&scrambled, "MCZ_LEFT", false);
+
+        // Order follows the camera list, not the order things were clicked.
+        let expected: Vec<String> = MARS2020_CAMERAS
+            .iter()
+            .filter(|c| ["NAVCAM_LEFT", "MCZ_LEFT", "SKYCAM"].contains(c))
+            .map(|c| c.to_string())
+            .collect();
+        assert_eq!(toggled, expected);
+    }
+
+    #[test]
+    fn unticking_the_last_camera_is_allowed_but_queries_nothing() {
+        let one = vec!["SKYCAM".to_string()];
+
+        let none = apply_camera_toggle(&one, "SKYCAM", false);
+
+        assert!(none.is_empty());
+        let f = Filters {
+            enabled_cameras: none,
+            ..Filters::default()
+        };
+        assert!(f.no_cameras_enabled());
+    }
+
+    #[test]
+    fn no_request_is_made_when_every_camera_is_off() {
+        let (mut app, dir) = test_app_thumbs_only(&["A"]);
+        app.exhausted = false;
+        app.filters.enabled_cameras.clear();
+
+        let before = app.fetcher.issued_count();
+        app.request_more();
+
+        // Such a query can only come back empty, so it is not worth sending.
+        assert_eq!(app.fetcher.issued_count(), before);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn alt_click_reaches_the_camera_list_through_the_ui() {
+        let (app, dir) = test_app_thumbs_only(&["A"]);
+        let mut harness =
+            egui_kittest::Harness::new_ui_state(|ui, app: &mut App| app.ui_impl(ui), app);
+        settle(&mut harness);
+
+        assert!(harness.state().filters.all_cameras_enabled());
+
+        // The modifier has to survive the trip through the checkbox, which
+        // flips its own bool before the handler sees the click.
+        harness
+            .get_by_label("MCZ_LEFT")
+            .click_modifiers(egui::Modifiers::ALT);
+        settle(&mut harness);
+
+        assert_eq!(
+            harness.state().filters.enabled_cameras,
+            vec!["MCZ_LEFT".to_string()],
+            "alt-click should isolate the camera, not merely untick it"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_plain_click_only_unticks_one_camera() {
+        let (app, dir) = test_app_thumbs_only(&["A"]);
+        let mut harness =
+            egui_kittest::Harness::new_ui_state(|ui, app: &mut App| app.ui_impl(ui), app);
+        settle(&mut harness);
+
+        harness.get_by_label("MCZ_LEFT").click();
+        settle(&mut harness);
+
+        let enabled = &harness.state().filters.enabled_cameras;
+        assert_eq!(enabled.len(), MARS2020_CAMERAS.len() - 1);
+        assert!(!enabled.iter().any(|c| c == "MCZ_LEFT"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_camera_list_uses_the_height_it_is_given() {
+        let ctx = egui::Context::default();
+        let mut cameras: Vec<String> = Vec::new();
+
+        // Ample room: every camera should be reachable without scrolling,
+        // rather than the list keeping to a fixed slice of the sidebar and
+        // leaving the rest of the panel empty.
+        let mut roomy = None;
+        let mut cramped = None;
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            ui.allocate_ui(egui::vec2(230.0, 600.0), |ui| {
+                roomy = Some(camera_list(ui, &mut cameras));
+            });
+            ui.allocate_ui(egui::vec2(230.0, 150.0), |ui| {
+                cramped = Some(camera_list(ui, &mut cameras));
+            });
+        });
+        output.textures_delta.clear();
+
+        let roomy = roomy.unwrap();
+        assert!(
+            !roomy.needs_scrolling(),
+            "list still scrolled with {} of space for {} of cameras",
+            roomy.viewport_height,
+            roomy.content_height
+        );
+
+        // And it still yields when the window genuinely is short.
+        let cramped = cramped.unwrap();
+        assert!(cramped.needs_scrolling());
+        assert!(cramped.viewport_height <= roomy.viewport_height);
+    }
+
+    #[test]
+    fn the_camera_list_claims_the_full_width_available_to_it() {
+        // The camera names are narrower than the panel, so a scroll area left
+        // to shrink to its content claims only that much width and leaves its
+        // scroll bar floating well inside the panel edge.
+        let ctx = egui::Context::default();
+        let mut cameras = Vec::new();
+        let (mut available, mut claimed) = (0.0_f32, 0.0_f32);
+
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            available = ui.available_width();
+            camera_list(ui, &mut cameras);
+            claimed = ui.min_rect().width();
+        });
+        output.textures_delta.clear();
+
+        assert!(
+            claimed >= available - 1.0,
+            "camera list claimed {claimed} of {available} available"
+        );
+    }
+
+    #[test]
+    fn the_sol_control_and_its_button_share_one_row_inside_the_sidebar() {
+        let (mut app, dir) = test_app_thumbs_only(&["A"]);
+        app.latest_sol = Some(1965);
+        app.filters.up_to_sol = Some(1000);
+
+        let mut harness =
+            egui_kittest::Harness::new_ui_state(|ui, app: &mut App| app.ui_impl(ui), app);
+        settle(&mut harness);
+
+        let button = harness.get_by_label("Reset").rect();
+
+        // On its own row the button would start at the sidebar's left margin.
+        assert!(
+            button.min.x > SOL_SLIDER_WIDTH,
+            "button wrapped onto its own row, starting at x={}",
+            button.min.x
+        );
+        // And it must not be pushed out past the sidebar to achieve that.
+        assert!(
+            button.max.x <= SIDEBAR_WIDTH,
+            "button overflows the sidebar: ends at x={} of {SIDEBAR_WIDTH}",
+            button.max.x
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn full_resolution_progress_is_reported_only_for_the_open_image() {
+        let (mut app, dir) = test_app_thumbs_only(&["A"]);
+
+        // Nothing open.
+        assert_eq!(app.full_res_status(), None);
+
+        app.selected = Some(0);
+        assert_eq!(app.full_res_status(), None, "idle, so nothing to report");
+
+        app.full_res_pending = true;
+        assert_eq!(app.full_res_status(), Some(FullResStatus::Loading));
+
+        let ctx = egui::Context::default();
+        let tex = ctx.load_texture(
+            "f",
+            egui::ColorImage::from_rgba_unmultiplied([1, 1], &[1, 2, 3, 255]),
+            egui::TextureOptions::LINEAR,
+        );
+        app.textures.insert(full_res_url("A"), tex, Tier::Detail);
+        assert_eq!(app.full_res_status(), Some(FullResStatus::Loaded));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_image_without_an_original_never_claims_full_resolution() {
+        let dir = temp_cache_dir();
+        let cache = Cache::open_at(&dir, DEFAULT_CACHE_BUDGET).unwrap();
+        let mut app = offline_app(egui::Context::default(), cache);
+
+        // `url_for` falls back to smaller renditions, so asking it would
+        // report full resolution for an image that publishes none.
+        app.absorb(vec![test_image("A")]);
+        app.selected = Some(0);
+        app.full_res_pending = true;
+
+        assert_eq!(app.full_res_status(), None);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_detail_toolbar_keeps_a_fixed_set_of_controls() {
+        let (mut app, dir) = test_app_thumbs_only(&["A"]);
+        app.selected = Some(0);
+
+        let mut harness =
+            egui_kittest::Harness::new_ui_state(|ui, app: &mut App| app.ui_impl(ui), app);
+        settle(&mut harness);
+
+        // The progress text lives in the status bar now; in the toolbar it
+        // would appear and vanish, shifting the buttons beside it.
+        harness.state_mut().full_res_pending = true;
+        settle(&mut harness);
+
+        for label in ["Fit", "+", "Save…"] {
+            assert!(
+                harness.query_by_label(label).is_some(),
+                "{label} should still be present"
+            );
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn arrowing_off_the_end_asks_for_the_next_page() {
+        let (mut app, dir) = test_app_thumbs_only(&["A", "B", "C"]);
+        app.exhausted = false;
+        app.next_page = 1;
+
+        let mut harness =
+            egui_kittest::Harness::new_ui_state(|ui, app: &mut App| app.ui_impl(ui), app);
+        settle(&mut harness);
+        harness.get_by_label("C").click();
+        settle(&mut harness);
+
+        let before = harness.state().fetcher.issued_count();
+        harness.key_press(egui::Key::ArrowRight);
+        settle(&mut harness);
+
+        // Paging is driven by the gallery's scroll position, which does not
+        // run in the detail view; without this, keyboard browsing stops at
+        // the edge of the loaded batch.
+        assert!(
+            harness.state().fetcher.issued_count() > before,
+            "stepping past the last image should request more"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_step_past_the_end_resumes_when_the_page_arrives() {
+        let (mut app, dir) = test_app_thumbs_only(&["A", "B"]);
+        app.exhausted = false;
+        app.selected = Some(1);
+        app.pending_advance = true;
+
+        app.merge_listing(1, false, vec![test_image("C")], Some(3));
+        app.resume_pending_advance();
+
+        assert_eq!(
+            app.selected,
+            Some(2),
+            "browsing should carry on to the new image"
+        );
+        assert!(!app.pending_advance);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn leaving_the_viewer_cancels_a_queued_step() {
+        let (mut app, dir) = test_app_thumbs_only(&["A", "B"]);
+        app.exhausted = false;
+        app.selected = Some(1);
+        app.pending_advance = true;
+
+        // Back to the gallery: a page arriving later must not yank the user
+        // into an image they no longer had open.
+        app.selected = None;
+        let mut harness =
+            egui_kittest::Harness::new_ui_state(|ui, app: &mut App| app.ui_impl(ui), app);
+        settle(&mut harness);
+
+        harness
+            .state_mut()
+            .merge_listing(1, false, vec![test_image("C")], Some(3));
+        settle(&mut harness);
+
+        assert_eq!(harness.state().selected, None);
+        assert!(!harness.state().pending_advance);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn stepping_backwards_from_the_first_image_stays_put() {
+        let (mut app, dir) = test_app_thumbs_only(&["A", "B"]);
+        app.selected = Some(0);
+
+        app.step_selection(-1);
+
+        assert_eq!(app.selected, Some(0));
+        assert!(!app.pending_advance, "going back should never queue a step");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_next_page_is_requested_well_before_the_end_of_the_batch() {
+        // A full page of results, viewed from the top.
+        let ids: Vec<String> = (0..100).map(|i| format!("P{i:03}")).collect();
+        let refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
+        let (mut app, dir) = test_app_thumbs_only(&refs);
+        app.exhausted = false;
+        app.next_page = 1;
+
+        let mut harness =
+            egui_kittest::Harness::new_ui_state(|ui, app: &mut App| app.ui_impl(ui), app);
+        settle(&mut harness);
+
+        // Each page costs the same long delay upstream, so the fetch has to
+        // begin about a page early rather than as the last row appears.
+        assert!(
+            harness.state().fetcher.issued_count() > 0,
+            "the next page should already be on its way while the user is \
+             still near the top of the current one"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn selecting_an_image_prefetches_its_neighbours() {
+        // Eight images, selecting the fourth: the window should reach three
+        // either side and stop, leaving the last untouched.
+        let (app, dir) = test_app_thumbs_only(&["A", "B", "C", "D", "E", "F", "G", "H"]);
+        let mut harness =
+            egui_kittest::Harness::new_ui_state(|ui, app: &mut App| app.ui_impl(ui), app);
+        settle(&mut harness);
+
+        // Requests drain as they fail, so count dispatches rather than
+        // whatever happens to be in flight at the moment of the assertion.
+        let before = harness.state().fetcher.issued_count();
+        harness.get_by_label("D").click();
+        settle(&mut harness);
+        let issued = harness.state().fetcher.issued_count() - before;
+
+        // A through G, and not H.
+        let expected = 1 + 2 * PREFETCH_RADIUS as u64;
+        assert_eq!(
+            issued, expected,
+            "should fetch the selection plus {PREFETCH_RADIUS} either side"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn stepping_to_a_neighbour_shows_its_thumbnail_rather_than_a_loading_screen() {
+        let (app, dir) = test_app_thumbs_only(&["A", "B", "C"]);
+        let mut harness =
+            egui_kittest::Harness::new_ui_state(|ui, app: &mut App| app.ui_impl(ui), app);
+        settle(&mut harness);
+        harness.get_by_label("B").click();
+        settle(&mut harness);
+
+        // The detail rendition is absent, so without the fallback this would
+        // be the empty "Loading image…" panel.
+        assert!(!harness.state().textures.contains(&large_url("B")));
+        assert_eq!(
+            harness.state().detail_content,
+            DetailContent::StandIn,
+            "a decoded thumbnail should stand in while the detail loads"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn browsing_many_images_does_not_grow_textures_without_bound() {
+        let ids: Vec<String> = (0..40).map(|i| format!("IMG{i:02}")).collect();
+        let refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
+        let (app, dir) = test_app(&refs);
+
+        let mut harness =
+            egui_kittest::Harness::new_ui_state(|ui, app: &mut App| app.ui_impl(ui), app);
+        settle(&mut harness);
+        harness.get_by_label("IMG00").click();
+        settle(&mut harness);
+
+        for _ in 0..39 {
+            harness.key_press(egui::Key::ArrowRight);
+            settle(&mut harness);
+        }
+
+        let details = harness.state().textures.count(Tier::Detail);
+        assert!(
+            details <= crate::textures::DEFAULT_DETAIL_CAPACITY,
+            "detail textures grew to {details}, past the budget"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1147,9 +2312,10 @@ mod tests {
             "Fit",
             "\u{2212}",
             "+",
-            "Load full resolution",
             "Save\u{2026}",
             "full resolution",
+            "loading full resolution",
+            "fetching more results…",
             "Gallery",
             "Clear",
             "reset",
@@ -1157,17 +2323,19 @@ mod tests {
             "online",
             "offline",
             "Perseverance",
-            "Sol",
-            "Order",
+            "Up to sol",
+            "(Martian day; 0 is landing)",
+            "Reset",
+            "waiting for the first results",
             "Cameras",
-            "Newest first",
-            "Oldest first",
-            "Date taken",
+            "All",
+            "Every camera is switched off.",
+            "Alt-click to show only this camera",
+            "Alt-click to show every other camera",
             "Loading\u{2026}",
             "Loading image\u{2026}",
             "No images match these filters.",
             "\u{2026}",
-            "Sol must be a number",
             "\u{00b7} showing cached results",
             "Sol 1000 \u{00b7} NAVCAM_LEFT",
         ];
@@ -1254,35 +2422,51 @@ mod tests {
     }
 
     #[test]
-    fn filters_map_a_sol_to_both_bounds() {
+    fn the_slider_sets_an_upper_bound_not_an_exact_day() {
         let f = Filters {
-            sol: " 1000 ".into(),
-            cameras: vec!["NAVCAM_LEFT".into()],
-            order: Order::SolDesc,
+            up_to_sol: Some(1000),
+            enabled_cameras: vec!["NAVCAM_LEFT".into()],
         };
         let q = f.to_query();
 
-        assert_eq!(q.min_sol, Some(1000));
+        // An upper bound only: results run back from sol 1000, so browsing
+        // carries on into earlier sols instead of stopping at that day.
         assert_eq!(q.max_sol, Some(1000));
+        assert_eq!(q.min_sol, None);
+        assert_eq!(q.order, Order::SolDesc);
         assert_eq!(q.cameras, vec!["NAVCAM_LEFT".to_string()]);
     }
 
     #[test]
-    fn a_blank_or_invalid_sol_means_no_sol_filter() {
-        for text in ["", "   ", "abc"] {
-            let f = Filters {
-                sol: text.into(),
-                ..Filters::default()
-            };
-            assert_eq!(f.to_query().min_sol, None, "input {text:?}");
-        }
+    fn no_sol_selected_starts_from_the_latest() {
+        let q = Filters::default().to_query();
+
+        assert_eq!(q.min_sol, None);
+        assert_eq!(q.max_sol, None);
+        assert_eq!(q.order, Order::SolDesc);
+    }
+
+    #[test]
+    fn the_newest_sol_seen_never_decreases() {
+        let dir = temp_cache_dir();
+        let cache = Cache::open_at(&dir, DEFAULT_CACHE_BUDGET).unwrap();
+        let mut app = offline_app(egui::Context::default(), cache);
+
+        app.absorb(vec![sol_image("A", 1900), sol_image("B", 1965)]);
+        assert_eq!(app.latest_sol, Some(1965));
+
+        // Narrowing to one day must not shrink the slider's range.
+        app.absorb(vec![sol_image("C", 12)]);
+        assert_eq!(app.latest_sol, Some(1965));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn changing_filters_changes_the_cache_key() {
         let a = Filters::default();
         let b = Filters {
-            sol: "1000".into(),
+            up_to_sol: Some(1000),
             ..Filters::default()
         };
         assert_ne!(a.to_query().cache_key(), b.to_query().cache_key());
