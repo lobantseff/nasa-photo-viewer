@@ -38,8 +38,9 @@ A mouse wheel and a trackpad swipe are told apart by their scroll unit:
 wheels report discrete lines, trackpads report continuous points. A touch
 mouse that reports points, such as a Magic Mouse, therefore pans.
 
-Zoom stops once the whole image is visible; an image smaller than the
-window stops at 1:1 rather than being upscaled to fill it.
+Zoom ranges from "the whole image is visible" up to 400%, measured
+against the source pixels. An image smaller than the window opens at 1:1
+rather than being upscaled to fill it.
 
 The cache lives in the platform cache directory (on macOS,
 `~/Library/Caches/dev.npv.nasa-photo-viewer`). Deleting it is safe.

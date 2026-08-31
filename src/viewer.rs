@@ -2,8 +2,11 @@
 
 use egui::{Rect, Vec2};
 
-/// Hard ceiling on magnification, well past pixel-peeping range.
-pub const MAX_SCALE: f32 = 40.0;
+/// Hard ceiling on magnification: four source pixels per point.
+///
+/// Beyond this the view shows interpolation rather than detail, since these
+/// are the original camera pixels once the full-resolution image has loaded.
+pub const MAX_SCALE: f32 = 4.0;
 
 /// Absolute floor, only reached for degenerate image sizes.
 const ABSOLUTE_MIN_SCALE: f32 = 0.01;

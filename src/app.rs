@@ -734,6 +734,7 @@ mod tests {
     use super::*;
 
     use crate::cache::{Cache, DEFAULT_CACHE_BUDGET};
+    use crate::viewer::MAX_SCALE;
     use egui_kittest::kittest::Queryable as _;
 
     fn full_res_url(id: &str) -> String {
@@ -797,7 +798,7 @@ mod tests {
             ] {
                 // Large enough that zooming in genuinely overflows the
                 // viewport, which is what makes panning possible.
-                const N: usize = 64;
+                const N: usize = 256;
                 let pixels = vec![200u8; N * N * 4];
                 let tex = ctx.load_texture(
                     url.clone(),
@@ -849,8 +850,21 @@ mod tests {
 
         // Zoom well past "fit" so the image is much larger than its viewport.
         harness.state_mut().zoom.needs_fit = false;
-        harness.state_mut().zoom.scale = 25.0;
+        harness.state_mut().zoom.scale = MAX_SCALE;
         settle(&mut harness);
+
+        // Guard against a vacuous test: if the zoomed image fitted inside the
+        // window there would be nothing for clipping to prevent.
+        let shown = harness
+            .state()
+            .shown_size
+            .expect("an image should be shown");
+        let scaled = shown * harness.state().zoom.scale;
+        let screen = harness.ctx.input(|i| i.viewport_rect());
+        assert!(
+            scaled.x > screen.width() && scaled.y > screen.height(),
+            "zoomed image {scaled:?} fits inside {screen:?}, so clipping is untested"
+        );
 
         let toolbar = harness.get_by_label("Fit").rect();
 
@@ -933,7 +947,7 @@ mod tests {
 
         hover_image_area(&mut harness);
         harness.state_mut().zoom.needs_fit = false;
-        harness.state_mut().zoom.scale = 8.0;
+        harness.state_mut().zoom.scale = 2.0;
         settle(&mut harness);
 
         assert!(
@@ -1006,7 +1020,7 @@ mod tests {
 
         // Zoom in first, otherwise the image fits and panning is pinned.
         harness.state_mut().zoom.needs_fit = false;
-        harness.state_mut().zoom.scale = 20.0;
+        harness.state_mut().zoom.scale = MAX_SCALE;
         settle(&mut harness);
         let before = harness.state().zoom.offset;
 
