@@ -505,9 +505,12 @@ impl App {
 
         let viewport = ui.available_rect_before_wrap();
         let response = ui.allocate_rect(viewport, egui::Sense::click_and_drag());
+        // A zoomed image is deliberately larger than the viewport, so all
+        // painting must be clipped or it spills over the surrounding panels.
+        let painter = ui.painter_at(viewport);
 
         let Some(texture) = texture else {
-            ui.painter().text(
+            painter.text(
                 viewport.center(),
                 egui::Align2::CENTER_CENTER,
                 "Loading image…",
@@ -539,9 +542,13 @@ impl App {
         self.zoom.clamp_to(img_size, viewport);
 
         let rect = self.zoom.image_rect(img_size, viewport);
-        ui.painter()
-            .rect_filled(viewport, 0.0, Color32::from_gray(18));
-        egui::Image::new(texture).paint_at(ui, rect);
+        painter.rect_filled(viewport, 0.0, Color32::from_gray(18));
+        painter.image(
+            texture.id(),
+            rect,
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            Color32::WHITE,
+        );
 
         // Metadata overlay.
         let text = format!(
@@ -555,7 +562,7 @@ impl App {
             image.id(),
         );
         let pos = viewport.left_bottom() + Vec2::new(10.0, -10.0);
-        ui.painter().text(
+        painter.text(
             pos,
             egui::Align2::LEFT_BOTTOM,
             text,
@@ -714,6 +721,41 @@ mod tests {
         // Regression: the thumbnail used to swallow its own click, so the
         // detail view could never be opened.
         assert_eq!(harness.state().selected, Some(1));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_zoomed_image_never_paints_over_the_toolbar() {
+        let (app, dir) = test_app(&["ALPHA"]);
+        let mut harness =
+            egui_kittest::Harness::new_ui_state(|ui, app: &mut App| app.ui_impl(ui), app);
+        harness.run();
+
+        harness.get_by_label("ALPHA").click();
+        harness.run();
+
+        // Zoom well past "fit" so the image is much larger than its viewport.
+        harness.state_mut().zoom.needs_fit = false;
+        harness.state_mut().zoom.scale = 25.0;
+        harness.run();
+
+        let toolbar = harness.get_by_label("Fit").rect();
+
+        // The image is intentionally larger than the viewport when zoomed, so
+        // correctness depends entirely on it being clipped.
+        let offending: Vec<_> = harness
+            .output()
+            .shapes
+            .iter()
+            .filter(|cs| matches!(cs.shape, egui::Shape::Mesh(_)))
+            .filter(|cs| cs.clip_rect.intersects(toolbar))
+            .collect();
+
+        assert!(
+            offending.is_empty(),
+            "image mesh was allowed to paint over the toolbar at {toolbar:?}"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
