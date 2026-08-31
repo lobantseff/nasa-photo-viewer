@@ -117,6 +117,22 @@ impl Fetcher {
         self.inflight.len()
     }
 
+    /// Listing pages currently being fetched.
+    pub fn inflight_listings(&self) -> usize {
+        self.inflight
+            .iter()
+            .filter(|k| k.starts_with("listing:"))
+            .count()
+    }
+
+    /// Images currently being fetched or decoded.
+    pub fn inflight_images(&self) -> usize {
+        self.inflight
+            .iter()
+            .filter(|k| k.starts_with("image:"))
+            .count()
+    }
+
     /// Total requests dispatched since start.
     pub fn issued_count(&self) -> u64 {
         self.issued
@@ -409,6 +425,26 @@ mod tests {
             updates.iter().any(|u| matches!(u, Update::Failed { .. })),
             "an uncached offline request must surface an error"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn inflight_work_is_reported_by_kind() {
+        let dir = temp_dir("kinds");
+        let cache = Cache::open_at(&dir, DEFAULT_CACHE_BUDGET).unwrap();
+        let client = Client::with_endpoint("http://127.0.0.1:1/").unwrap();
+        let mut fetcher = Fetcher::with_client(egui::Context::default(), cache, client).unwrap();
+
+        fetcher.request_listing(&Query::default(), 0);
+        fetcher.request_image("https://x/a.jpg", ImageKind::Thumbnail);
+        fetcher.request_image("https://x/b.jpg", ImageKind::Thumbnail);
+
+        // A single slow listing alongside two images must not be reported as
+        // one indistinguishable count.
+        assert_eq!(fetcher.inflight_listings(), 1);
+        assert_eq!(fetcher.inflight_images(), 2);
+        assert_eq!(fetcher.inflight_count(), 3);
 
         std::fs::remove_dir_all(&dir).ok();
     }

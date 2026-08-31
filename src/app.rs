@@ -18,7 +18,11 @@ const THUMB_SIZE: f32 = 150.0;
 const PREFETCH_ROWS: usize = 3;
 
 /// Request the next page once this many images remain below the viewport.
-const PAGE_LOOKAHEAD: usize = 30;
+///
+/// Every page costs the same large fixed delay upstream, so the request has to
+/// start roughly a full page before it is needed; a short runway means
+/// scrolling always ends in a wait.
+const PAGE_LOOKAHEAD: usize = MAX_PAGE_SIZE as usize + 20;
 
 const STORAGE_KEY: &str = "npv_filters";
 
@@ -123,8 +127,10 @@ impl App {
 
     /// Construct without touching storage or the network.
     fn build(ctx: egui::Context, cache: Cache, filters: Filters) -> anyhow::Result<Self> {
-        let fetcher = Fetcher::new(ctx, cache)?;
+        Self::from_fetcher(Fetcher::new(ctx, cache)?, filters)
+    }
 
+    fn from_fetcher(fetcher: Fetcher, filters: Filters) -> anyhow::Result<Self> {
         Ok(Self {
             active_key: filters.to_query().cache_key(),
             fetcher,
@@ -367,9 +373,18 @@ impl App {
                         "· cached results"
                     });
                 }
-                if self.fetcher.inflight_count() > 0 {
+                // Report the two kinds of work separately: a lone slow page
+                // fetch and a burst of thumbnails look identical otherwise.
+                let listings = self.fetcher.inflight_listings();
+                let images = self.fetcher.inflight_images();
+                if listings > 0 || images > 0 {
                     ui.spinner();
-                    ui.label(format!("{} loading", self.fetcher.inflight_count()));
+                }
+                if listings > 0 {
+                    ui.label("fetching more results…");
+                }
+                if images > 0 {
+                    ui.label(format!("{images} image(s) loading"));
                 }
 
                 if let Some(err) = self.error.clone() {
@@ -860,6 +875,14 @@ mod tests {
     use crate::viewer::MAX_SCALE;
     use egui_kittest::kittest::Queryable as _;
 
+    /// An app whose fetcher points at a refused port, so no test can reach
+    /// the real service.
+    fn offline_app(ctx: egui::Context, cache: Cache) -> App {
+        let client = crate::client::Client::with_endpoint("http://127.0.0.1:1/").unwrap();
+        let fetcher = Fetcher::with_client(ctx, cache, client).unwrap();
+        App::from_fetcher(fetcher, Filters::default()).unwrap()
+    }
+
     fn temp_cache_dir() -> std::path::PathBuf {
         static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let dir = std::env::temp_dir().join(format!(
@@ -923,7 +946,7 @@ mod tests {
         }
 
         let ctx = egui::Context::default();
-        let mut app = App::build(ctx.clone(), cache, Filters::default()).unwrap();
+        let mut app = offline_app(ctx.clone(), cache);
 
         let images: Vec<Image> = ids
             .iter()
@@ -1189,7 +1212,7 @@ mod tests {
 
         let cache = Cache::open_at(&dir, DEFAULT_CACHE_BUDGET).unwrap();
         let ctx = egui::Context::default();
-        let mut app = App::build(ctx, cache, Filters::default()).unwrap();
+        let mut app = offline_app(ctx, cache);
         app.prime_from_cache();
 
         // Upstream can take many seconds; the user should not stare at an
@@ -1205,7 +1228,7 @@ mod tests {
         let dir = temp_cache_dir();
         let cache = Cache::open_at(&dir, DEFAULT_CACHE_BUDGET).unwrap();
         let ctx = egui::Context::default();
-        let mut app = App::build(ctx, cache, Filters::default()).unwrap();
+        let mut app = offline_app(ctx, cache);
 
         app.serving_stale = true;
         app.absorb(vec![test_image("OLD1"), test_image("OLD2")]);
@@ -1231,7 +1254,7 @@ mod tests {
         let dir = temp_cache_dir();
         let cache = Cache::open_at(&dir, DEFAULT_CACHE_BUDGET).unwrap();
         let ctx = egui::Context::default();
-        let mut app = App::build(ctx, cache, Filters::default()).unwrap();
+        let mut app = offline_app(ctx, cache);
 
         app.serving_stale = true;
         app.absorb(vec![test_image("A")]);
@@ -1254,6 +1277,30 @@ mod tests {
         // Filters usually overlap, so discarding decoded thumbnails would
         // force them all to be fetched and decoded again.
         assert_eq!(app.textures.count(Tier::Thumbnail), before);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_next_page_is_requested_well_before_the_end_of_the_batch() {
+        // A full page of results, viewed from the top.
+        let ids: Vec<String> = (0..100).map(|i| format!("P{i:03}")).collect();
+        let refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
+        let (mut app, dir) = test_app_thumbs_only(&refs);
+        app.exhausted = false;
+        app.next_page = 1;
+
+        let mut harness =
+            egui_kittest::Harness::new_ui_state(|ui, app: &mut App| app.ui_impl(ui), app);
+        settle(&mut harness);
+
+        // Each page costs the same long delay upstream, so the fetch has to
+        // begin about a page early rather than as the last row appears.
+        assert!(
+            harness.state().fetcher.issued_count() > 0,
+            "the next page should already be on its way while the user is \
+             still near the top of the current one"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
