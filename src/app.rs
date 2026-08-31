@@ -26,6 +26,11 @@ const PAGE_LOOKAHEAD: usize = MAX_PAGE_SIZE as usize + 20;
 
 const STORAGE_KEY: &str = "npv_filters";
 
+/// Persisted separately from the filters: with a sol filter restored at
+/// launch, every image loaded is from that one day, so the slider's upper
+/// bound cannot be recovered from the results.
+const LATEST_SOL_KEY: &str = "npv_latest_sol";
+
 /// Back-navigation label.
 ///
 /// egui's default fonts have no arrow glyphs (U+2190 and the emoji arrows all
@@ -58,7 +63,8 @@ const BACK_LABEL: &str = "\u{2039} Gallery";
 
 #[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Filters {
-    pub sol: String,
+    /// A single Martian day to show, or `None` for every sol.
+    pub sol: Option<i64>,
     pub cameras: Vec<String>,
     pub order: Order,
 }
@@ -66,7 +72,7 @@ pub struct Filters {
 impl Default for Filters {
     fn default() -> Self {
         Self {
-            sol: String::new(),
+            sol: None,
             cameras: Vec::new(),
             order: Order::SolDesc,
         }
@@ -75,7 +81,7 @@ impl Default for Filters {
 
 impl Filters {
     pub fn to_query(&self) -> Query {
-        let sol = self.sol.trim().parse::<i64>().ok();
+        let sol = self.sol;
         Query {
             num: MAX_PAGE_SIZE,
             page: 0,
@@ -109,6 +115,8 @@ pub struct App {
     full_res_pending: bool,
     /// A right-arrow press that ran past the loaded batch, waiting on a page.
     pending_advance: bool,
+    /// Highest sol observed, which bounds the sol slider.
+    latest_sol: Option<i64>,
     detail_content: DetailContent,
     error: Option<String>,
     serving_stale: bool,
@@ -122,6 +130,10 @@ impl App {
             .unwrap_or_default();
 
         let mut app = Self::build(cc.egui_ctx.clone(), cache, filters)?;
+        app.latest_sol = cc
+            .storage
+            .and_then(|s| eframe::get_value::<Option<i64>>(s, LATEST_SOL_KEY))
+            .flatten();
         app.prime_from_cache();
         app.request_more();
         Ok(app)
@@ -148,6 +160,7 @@ impl App {
             shown_size: None,
             full_res_pending: false,
             pending_advance: false,
+            latest_sol: None,
             detail_content: DetailContent::default(),
             error: None,
             serving_stale: false,
@@ -179,6 +192,11 @@ impl App {
 
     fn absorb(&mut self, images: Vec<Image>) {
         for image in images {
+            // Kept monotonic: filtering to one sol would otherwise shrink the
+            // slider's range to that day.
+            if let Some(sol) = image.sol {
+                self.latest_sol = Some(self.latest_sol.map_or(sol, |seen| seen.max(sol)));
+            }
             if self.seen.insert(image.id().to_string()) {
                 self.images.push(image);
             }
@@ -282,21 +300,40 @@ impl App {
 
                 let before = self.filters.clone();
 
-                ui.label("Sol");
                 ui.horizontal(|ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.filters.sol)
-                            .hint_text("latest")
-                            .desired_width(110.0),
-                    );
-                    if ui.button("Clear").clicked() {
-                        self.filters.sol.clear();
-                    }
+                    ui.label("Sol");
+                    ui.label(RichText::new("(Martian day; 0 is landing)").weak().small());
                 });
-                if !self.filters.sol.trim().is_empty()
-                    && self.filters.sol.trim().parse::<i64>().is_err()
-                {
-                    ui.colored_label(Color32::LIGHT_RED, "Sol must be a number");
+
+                match self.latest_sol {
+                    Some(latest) => {
+                        // The slider's value box accepts typing, so the exact
+                        // sol is still reachable without dragging.
+                        let mut value = self.filters.sol.unwrap_or(latest).clamp(0, latest);
+                        let changed = ui
+                            .add(egui::Slider::new(&mut value, 0..=latest).step_by(1.0))
+                            .changed();
+                        if changed {
+                            self.filters.sol = Some(value);
+                        }
+
+                        ui.horizontal(|ui| {
+                            if self.filters.sol.is_some() {
+                                if ui.button("All sols").clicked() {
+                                    self.filters.sol = None;
+                                }
+                            } else {
+                                ui.label(RichText::new("all sols").weak().small());
+                            }
+                        });
+                    }
+                    None => {
+                        ui.label(
+                            RichText::new("waiting for the first results")
+                                .weak()
+                                .small(),
+                        );
+                    }
                 }
 
                 ui.add_space(10.0);
@@ -803,6 +840,7 @@ impl App {
 impl eframe::App for App {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, STORAGE_KEY, &self.filters);
+        eframe::set_value(storage, LATEST_SOL_KEY, &self.latest_sol);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -933,6 +971,15 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn sol_image(id: &str, sol: i64) -> Image {
+        serde_json::from_value(serde_json::json!({
+            "imageid": id,
+            "sol": sol,
+            "camera": { "instrument": "NAVCAM_LEFT" },
+        }))
+        .unwrap()
     }
 
     fn test_image(id: &str) -> Image {
@@ -1311,7 +1358,7 @@ mod tests {
         let before = app.textures.count(Tier::Thumbnail);
         assert!(before > 0);
 
-        app.filters.sol = "1000".into();
+        app.filters.sol = Some(1000);
         app.reset_for_new_filters();
 
         // Filters usually overlap, so discarding decoded thumbnails would
@@ -1660,6 +1707,10 @@ mod tests {
             "offline",
             "Perseverance",
             "Sol",
+            "(Martian day; 0 is landing)",
+            "All sols",
+            "all sols",
+            "waiting for the first results",
             "Order",
             "Cameras",
             "Newest first",
@@ -1669,7 +1720,6 @@ mod tests {
             "Loading image\u{2026}",
             "No images match these filters.",
             "\u{2026}",
-            "Sol must be a number",
             "\u{00b7} showing cached results",
             "Sol 1000 \u{00b7} NAVCAM_LEFT",
         ];
@@ -1758,33 +1808,47 @@ mod tests {
     #[test]
     fn filters_map_a_sol_to_both_bounds() {
         let f = Filters {
-            sol: " 1000 ".into(),
+            sol: Some(1000),
             cameras: vec!["NAVCAM_LEFT".into()],
             order: Order::SolDesc,
         };
         let q = f.to_query();
 
+        // A single Martian day is a range of one.
         assert_eq!(q.min_sol, Some(1000));
         assert_eq!(q.max_sol, Some(1000));
         assert_eq!(q.cameras, vec!["NAVCAM_LEFT".to_string()]);
     }
 
     #[test]
-    fn a_blank_or_invalid_sol_means_no_sol_filter() {
-        for text in ["", "   ", "abc"] {
-            let f = Filters {
-                sol: text.into(),
-                ..Filters::default()
-            };
-            assert_eq!(f.to_query().min_sol, None, "input {text:?}");
-        }
+    fn no_sol_selected_means_every_sol() {
+        let q = Filters::default().to_query();
+
+        assert_eq!(q.min_sol, None);
+        assert_eq!(q.max_sol, None);
+    }
+
+    #[test]
+    fn the_newest_sol_seen_never_decreases() {
+        let dir = temp_cache_dir();
+        let cache = Cache::open_at(&dir, DEFAULT_CACHE_BUDGET).unwrap();
+        let mut app = offline_app(egui::Context::default(), cache);
+
+        app.absorb(vec![sol_image("A", 1900), sol_image("B", 1965)]);
+        assert_eq!(app.latest_sol, Some(1965));
+
+        // Narrowing to one day must not shrink the slider's range.
+        app.absorb(vec![sol_image("C", 12)]);
+        assert_eq!(app.latest_sol, Some(1965));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn changing_filters_changes_the_cache_key() {
         let a = Filters::default();
         let b = Filters {
-            sol: "1000".into(),
+            sol: Some(1000),
             ..Filters::default()
         };
         assert_ne!(a.to_query().cache_key(), b.to_query().cache_key());

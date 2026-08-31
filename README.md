@@ -13,7 +13,9 @@ so repeat browsing is instant and works offline.
 - Zoom (cursor-anchored) and drag-to-pan detail view
 - 1200px preview loads immediately; the full-resolution PNG is fetched
   automatically once you zoom past it
-- Filter by sol and camera; sort newest/oldest/by capture date
+- Filter by sol (a Martian day, 0 being landing) with a slider whose value
+  box also accepts a typed sol, and by camera; sort newest/oldest/by capture
+  date
 - Local caching: SQLite for metadata, disk for images, ~2 GiB LRU budget
 - Decoded textures are kept in a bounded LRU, and the images either side of
   the selection are fetched ahead so arrow-key browsing does not stall
