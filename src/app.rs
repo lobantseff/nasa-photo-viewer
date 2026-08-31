@@ -332,10 +332,10 @@ impl App {
         }
 
         let spacing = ui.spacing().item_spacing.x;
-        // Reserve the scrollbar, otherwise the rightmost thumbnail wraps onto
-        // a row of its own and the grid looks ragged.
-        let scrollbar = ui.spacing().scroll.bar_width + ui.spacing().scroll.bar_inner_margin;
-        let columns = columns_for(ui.available_width() - scrollbar, THUMB_SIZE, spacing);
+        let scroll = ui.spacing().scroll;
+        let reserved =
+            scrollbar_allowance(scroll.floating, scroll.bar_width, scroll.bar_inner_margin);
+        let columns = columns_for(ui.available_width() - reserved, THUMB_SIZE, spacing);
         let cell = THUMB_SIZE + ui.spacing().item_spacing.y;
         let rows = self.images.len().div_ceil(columns);
 
@@ -695,6 +695,18 @@ fn status_dot(ui: &mut egui::Ui, color: Color32) {
         .circle_filled(rect.center(), diameter * 0.5, color);
 }
 
+/// Layout width to keep clear for the scroll bar.
+///
+/// A floating bar is drawn over the content and takes no width of its own, so
+/// reserving space for one loses a whole column on a wide window.
+fn scrollbar_allowance(floating: bool, bar_width: f32, inner_margin: f32) -> f32 {
+    if floating {
+        0.0
+    } else {
+        bar_width + inner_margin
+    }
+}
+
 /// How many thumbnails fit across `width`.
 ///
 /// `n` thumbnails occupy `n * thumb + (n - 1) * spacing`, so the spacing has to
@@ -933,6 +945,7 @@ mod tests {
         // Only the preview renditions have textures; the original is cached
         // as bytes but not yet decoded.
         let (app, dir) = test_app(&["ALPHA"]);
+        let full = full_res_url("ALPHA");
         let mut harness =
             egui_kittest::Harness::new_ui_state(|ui, app: &mut App| app.ui_impl(ui), app);
         settle(&mut harness);
@@ -941,18 +954,29 @@ mod tests {
 
         // Opening alone must not pull a multi-megabyte original.
         assert!(
-            !harness.state().full_res_pending,
+            !harness.state().textures.contains_key(&full),
             "opening an image should not fetch full resolution"
         );
 
         hover_image_area(&mut harness);
         harness.state_mut().zoom.needs_fit = false;
         harness.state_mut().zoom.scale = 2.0;
-        settle(&mut harness);
+
+        // The upgrade resolves from the cache on a worker thread, so give the
+        // UI a bounded number of frames to receive it.
+        let mut upgraded = false;
+        for _ in 0..200 {
+            settle(&mut harness);
+            if harness.state().textures.contains_key(&full) {
+                upgraded = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
 
         assert!(
-            harness.state().full_res_pending,
-            "magnifying the preview should fetch the original"
+            upgraded,
+            "magnifying the preview should load the full-resolution image"
         );
 
         std::fs::remove_dir_all(&dir).ok();
@@ -1193,6 +1217,22 @@ mod tests {
         assert_eq!(columns_for(629.0, 150.0, 10.0), 3);
         // A whole extra cell needs both the thumbnail and its leading gap.
         assert_eq!(columns_for(790.0, 150.0, 10.0), 5);
+    }
+
+    #[test]
+    fn a_floating_scroll_bar_reserves_no_width() {
+        // egui's default bar floats over the content.
+        assert_eq!(scrollbar_allowance(true, 10.0, 4.0), 0.0);
+        assert_eq!(scrollbar_allowance(false, 10.0, 4.0), 14.0);
+    }
+
+    #[test]
+    fn a_wide_window_uses_every_column_that_fits() {
+        // Eight 150px thumbnails and seven 8px gaps need 1256px. Reserving
+        // width for a floating scroll bar used to drop this to seven,
+        // leaving an empty column on the right.
+        assert_eq!(columns_for(1262.0, 150.0, 8.0), 8);
+        assert_eq!(columns_for(1262.0 - 14.0, 150.0, 8.0), 7);
     }
 
     #[test]
