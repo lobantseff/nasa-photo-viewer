@@ -515,6 +515,7 @@ impl App {
                             egui::Label::new(RichText::new(VERSION).weak())
                                 .sense(egui::Sense::click()),
                         )
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
                         .on_hover_text("About this application")
                         .clicked()
                     {
@@ -721,6 +722,9 @@ impl App {
         }
 
         if response.hovered() {
+            // A thumbnail opens the detail view, so it gets the same hand as
+            // any other clickable thing.
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             ui.painter().rect_stroke(
                 rect,
                 3.0,
@@ -1982,6 +1986,65 @@ mod tests {
                 "{gone:?} should have been removed from the status bar"
             );
         }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn hovering_the_version_shows_a_pointing_hand() {
+        let (app, dir) = test_app_thumbs_only(&["A"]);
+        let mut harness =
+            egui_kittest::Harness::new_ui_state(|ui, app: &mut App| app.ui_impl(ui), app);
+        settle(&mut harness);
+
+        let version = harness.get_by_label(VERSION).rect();
+        harness.hover_at(version.center());
+        settle(&mut harness);
+
+        // The version opens the About window, so it has to look clickable.
+        assert_eq!(
+            harness.output().platform_output.cursor_icon,
+            egui::CursorIcon::PointingHand
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn hovering_a_thumbnail_shows_a_pointing_hand() {
+        let (app, dir) = test_app_thumbs_only(&["A"]);
+        let mut harness =
+            egui_kittest::Harness::new_ui_state(|ui, app: &mut App| app.ui_impl(ui), app);
+        settle(&mut harness);
+
+        let thumb = harness.get_by_label("A").rect();
+        harness.hover_at(thumb.center());
+        settle(&mut harness);
+
+        assert_eq!(
+            harness.output().platform_output.cursor_icon,
+            egui::CursorIcon::PointingHand
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn empty_space_keeps_the_ordinary_cursor() {
+        let (app, dir) = test_app_thumbs_only(&["A"]);
+        let mut harness =
+            egui_kittest::Harness::new_ui_state(|ui, app: &mut App| app.ui_impl(ui), app);
+        settle(&mut harness);
+
+        // Guards against the hand being set unconditionally rather than only
+        // over something that responds to a click.
+        harness.hover_at(egui::pos2(1.0, 1.0));
+        settle(&mut harness);
+
+        assert_ne!(
+            harness.output().platform_output.cursor_icon,
+            egui::CursorIcon::PointingHand
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
