@@ -144,6 +144,25 @@ for image in client.list_all(&query, 50).await? {
 }
 ```
 
+## Versioning
+
+The version the application reports comes from git tags, not from
+`Cargo.toml`:
+
+```bash
+./increment_version.sh            # patch: v0.5.1 -> v0.5.2
+./increment_version.sh minor      #        v0.5.1 -> v0.6.0
+./increment_version.sh major      #        v0.5.1 -> v1.0.0
+./increment_version.sh --push     # and push the tag to origin
+./increment_version.sh --dry-run  # report the next version only
+```
+
+A build from a clean checkout sitting on a tag reports that tag, `v0.5.1`.
+Anything else reports a development version naming the commit it came from,
+`v0.5.1.dev3+a1b2c3d4`, with `.dirty` appended when the tree has uncommitted
+changes. The version is shown at the right of the status bar; clicking it
+opens the About window.
+
 ## Tests
 
 ```bash

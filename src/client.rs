@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail};
 use crate::model::{Image, ImageDetailResponse, ImageListResponse};
 use crate::query::{ENDPOINT, Query, detail_params};
 
-const USER_AGENT: &str = concat!("nasa-photo-viewer/", env!("CARGO_PKG_VERSION"));
+const USER_AGENT: &str = concat!("nasa-photo-viewer/", env!("NPV_VERSION"));
 
 /// Upper bound on pages fetched by [`Client::list_all`], so a feed that stops
 /// advancing cannot spin forever.

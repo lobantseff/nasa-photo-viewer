@@ -24,6 +24,10 @@ const PREFETCH_ROWS: usize = 3;
 /// scrolling always ends in a wait.
 const PAGE_LOOKAHEAD: usize = MAX_PAGE_SIZE as usize + 20;
 
+/// Version reported by the application, resolved from git tags at build time
+/// rather than from `Cargo.toml`. See `build.rs`.
+pub const VERSION: &str = env!("NPV_VERSION");
+
 const STORAGE_KEY: &str = "npv_filters";
 
 /// Persisted separately from the filters: with a sol filter restored at
@@ -35,13 +39,6 @@ const LATEST_SOL_KEY: &str = "npv_latest_sol";
 ///
 /// egui's default fonts have no arrow glyphs (U+2190 and the emoji arrows all
 /// render as tofu), so this uses a guillemet, which they do provide.
-/// Progress of the full-resolution original for the open image.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FullResStatus {
-    Loading,
-    Loaded,
-}
-
 /// What the detail view managed to draw this frame.
 ///
 /// Painted text is invisible to the accessibility tree, so this is what lets
@@ -186,6 +183,7 @@ pub struct App {
     pending_advance: bool,
     /// Highest sol observed, which bounds the sol slider.
     latest_sol: Option<i64>,
+    about_open: bool,
     detail_content: DetailContent,
     error: Option<String>,
     serving_stale: bool,
@@ -231,6 +229,7 @@ impl App {
             full_res_pending: false,
             pending_advance: false,
             latest_sol: None,
+            about_open: false,
             detail_content: DetailContent::default(),
             error: None,
             serving_stale: false,
@@ -353,24 +352,6 @@ impl App {
                 Update::Failed { error, .. } => self.error = Some(error),
                 Update::Connectivity { .. } => {}
             }
-        }
-    }
-
-    /// Where the full-resolution original has got to for the open image.
-    ///
-    /// Only images that genuinely publish one qualify: `url_for` falls back to
-    /// smaller renditions, so asking it would claim full resolution for an
-    /// image that has none.
-    fn full_res_status(&self) -> Option<FullResStatus> {
-        let image = self.visible_image(self.selected?)?;
-        let url = image.image_files.full_res.as_deref()?;
-
-        if self.textures.contains(url) {
-            Some(FullResStatus::Loaded)
-        } else if self.full_res_pending {
-            Some(FullResStatus::Loading)
-        } else {
-            None
         }
     }
 
@@ -525,34 +506,92 @@ impl App {
                     ui.label(format!("{images} image(s) loading"));
                 }
 
-                let full_res = self.full_res_status();
                 let error = self.error.clone();
-                if full_res.is_some() || error.is_some() {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        // Added first, so it sits hard against the right edge
-                        // and keeps a fixed home regardless of what else the
-                        // status bar is saying.
-                        match full_res {
-                            Some(FullResStatus::Loaded) => {
-                                ui.label(RichText::new("full resolution").italics());
-                            }
-                            Some(FullResStatus::Loading) => {
-                                ui.label(RichText::new("loading full resolution").italics());
-                                ui.spinner();
-                            }
-                            None => {}
-                        }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // Added first, so the version keeps the corner whatever
+                    // else the status bar is reporting.
+                    if ui
+                        .add(
+                            egui::Label::new(RichText::new(VERSION).weak())
+                                .sense(egui::Sense::click()),
+                        )
+                        .on_hover_text("About this application")
+                        .clicked()
+                    {
+                        self.about_open = true;
+                    }
 
-                        if let Some(err) = error {
-                            if ui.small_button("dismiss").clicked() {
-                                self.error = None;
-                            }
-                            ui.colored_label(Color32::LIGHT_RED, truncate(&err, 90));
+                    if let Some(err) = error {
+                        ui.separator();
+                        if ui.small_button("dismiss").clicked() {
+                            self.error = None;
                         }
-                    });
-                }
+                        ui.colored_label(Color32::LIGHT_RED, truncate(&err, 90));
+                    }
+                });
             });
         });
+    }
+
+    fn about_window(&mut self, ctx: &egui::Context) {
+        if !self.about_open {
+            return;
+        }
+
+        let mut open = true;
+        egui::Window::new("About")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.heading("NASA Photo Viewer");
+                ui.label(RichText::new(VERSION).weak());
+                ui.add_space(8.0);
+
+                ui.label(
+                    "A desktop browser for the raw images returned by NASA's \
+                     Mars 2020 rover, Perseverance.",
+                );
+                ui.add_space(8.0);
+
+                ui.separator();
+                egui::Grid::new("about_details")
+                    .num_columns(2)
+                    .spacing([12.0, 4.0])
+                    .show(ui, |ui| {
+                        ui.label(RichText::new("Images").weak());
+                        ui.hyperlink_to(
+                            "mars.nasa.gov/mars2020",
+                            "https://mars.nasa.gov/mars2020/multimedia/raw-images/",
+                        );
+                        ui.end_row();
+
+                        ui.label(RichText::new("Credit").weak());
+                        ui.label("NASA/JPL-Caltech");
+                        ui.end_row();
+
+                        ui.label(RichText::new("Cache").weak());
+                        ui.label(
+                            crate::cache::default_cache_dir()
+                                .map(|d| d.display().to_string())
+                                .unwrap_or_else(|_| "unavailable".to_string()),
+                        );
+                        ui.end_row();
+                    });
+
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(
+                        "Images are public domain. This viewer is not affiliated \
+                         with NASA.",
+                    )
+                    .weak()
+                    .small(),
+                );
+            });
+
+        self.about_open = open;
     }
 
     fn gallery(&mut self, ui: &mut egui::Ui) {
@@ -1006,6 +1045,7 @@ impl App {
 
         self.sidebar(ui);
         self.status_bar(ui);
+        self.about_window(&ctx);
 
         egui::CentralPanel::default().show(ui, |ui| match self.selected {
             Some(idx) if idx < self.visible_len() => self.detail(ui, idx),
@@ -1919,43 +1959,66 @@ mod tests {
     }
 
     #[test]
-    fn full_resolution_progress_is_reported_only_for_the_open_image() {
-        let (mut app, dir) = test_app_thumbs_only(&["A"]);
+    fn the_version_is_resolved_at_build_time() {
+        // Supplied by build.rs from `git describe`, never from Cargo.toml.
+        assert!(VERSION.starts_with('v'), "unexpected version {VERSION:?}");
+        assert!(VERSION.len() > 1);
+    }
 
-        // Nothing open.
-        assert_eq!(app.full_res_status(), None);
+    #[test]
+    fn the_status_bar_shows_the_version_and_no_longer_reports_full_resolution() {
+        let (app, dir) = test_app_thumbs_only(&["A"]);
+        let mut harness =
+            egui_kittest::Harness::new_ui_state(|ui, app: &mut App| app.ui_impl(ui), app);
+        settle(&mut harness);
 
-        app.selected = Some(0);
-        assert_eq!(app.full_res_status(), None, "idle, so nothing to report");
-
-        app.full_res_pending = true;
-        assert_eq!(app.full_res_status(), Some(FullResStatus::Loading));
-
-        let ctx = egui::Context::default();
-        let tex = ctx.load_texture(
-            "f",
-            egui::ColorImage::from_rgba_unmultiplied([1, 1], &[1, 2, 3, 255]),
-            egui::TextureOptions::LINEAR,
-        );
-        app.textures.insert(full_res_url("A"), tex, Tier::Detail);
-        assert_eq!(app.full_res_status(), Some(FullResStatus::Loaded));
+        assert!(harness.query_by_label(VERSION).is_some());
+        for gone in ["full resolution", "loading full resolution"] {
+            assert!(
+                harness.query_by_label(gone).is_none(),
+                "{gone:?} should have been removed from the status bar"
+            );
+        }
 
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn an_image_without_an_original_never_claims_full_resolution() {
-        let dir = temp_cache_dir();
-        let cache = Cache::open_at(&dir, DEFAULT_CACHE_BUDGET).unwrap();
-        let mut app = offline_app(egui::Context::default(), cache);
+    fn clicking_the_version_opens_the_about_window() {
+        let (app, dir) = test_app_thumbs_only(&["A"]);
+        let mut harness =
+            egui_kittest::Harness::new_ui_state(|ui, app: &mut App| app.ui_impl(ui), app);
+        settle(&mut harness);
 
-        // `url_for` falls back to smaller renditions, so asking it would
-        // report full resolution for an image that publishes none.
-        app.absorb(vec![test_image("A")]);
-        app.selected = Some(0);
-        app.full_res_pending = true;
+        assert!(!harness.state().about_open);
+        assert!(harness.query_by_label("NASA Photo Viewer").is_none());
 
-        assert_eq!(app.full_res_status(), None);
+        harness.get_by_label(VERSION).click();
+        settle(&mut harness);
+
+        assert!(harness.state().about_open);
+        // The window states what the application is and where its images
+        // come from, which is the whole point of opening it.
+        assert!(harness.query_by_label("NASA Photo Viewer").is_some());
+        assert!(harness.query_by_label("NASA/JPL-Caltech").is_some());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_about_window_can_be_closed_again() {
+        let (mut app, dir) = test_app_thumbs_only(&["A"]);
+        app.about_open = true;
+
+        let mut harness =
+            egui_kittest::Harness::new_ui_state(|ui, app: &mut App| app.ui_impl(ui), app);
+        settle(&mut harness);
+        assert!(harness.query_by_label("NASA Photo Viewer").is_some());
+
+        harness.state_mut().about_open = false;
+        settle(&mut harness);
+
+        assert!(harness.query_by_label("NASA Photo Viewer").is_none());
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2313,8 +2376,6 @@ mod tests {
             "\u{2212}",
             "+",
             "Save\u{2026}",
-            "full resolution",
-            "loading full resolution",
             "fetching more results…",
             "Gallery",
             "Clear",
@@ -2328,6 +2389,13 @@ mod tests {
             "Reset",
             "waiting for the first results",
             "Cameras",
+            "About",
+            "NASA Photo Viewer",
+            "About this application",
+            "NASA/JPL-Caltech",
+            "Credit",
+            "Images",
+            "Cache",
             "All",
             "Every camera is switched off.",
             "Alt-click to show only this camera",

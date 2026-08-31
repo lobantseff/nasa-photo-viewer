@@ -1,6 +1,10 @@
 [package]
 name = "nasa-photo-viewer"
-version = "0.1.0"
+# Unused. The version the application reports comes from `git describe` (see
+# build.rs), so a build always names the commit it was made from. Cargo still
+# requires this field, but nothing reads it: leaving it here to drift is
+# preferable to two sources of truth disagreeing about the release.
+version = "0.0.0"
 edition = "2024"
 
 [dependencies]
