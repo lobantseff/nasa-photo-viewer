@@ -63,6 +63,13 @@ pub enum DetailContent {
 /// the images just fetched behind.
 const PREFETCH_RADIUS: usize = 3;
 
+/// Width of the filter sidebar.
+const SIDEBAR_WIDTH: f32 = 230.0;
+
+/// Width of the sol slider's track, narrowed from egui's default so the
+/// "All sols" button shares its row within the sidebar.
+const SOL_SLIDER_WIDTH: f32 = 76.0;
+
 /// Lines a page-scroll stands for, on the rare device that reports pages.
 const PAGE_LINES: f32 = 10.0;
 
@@ -317,7 +324,7 @@ impl App {
     fn sidebar(&mut self, ui: &mut egui::Ui) {
         egui::Panel::left("filters")
             .resizable(false)
-            .exact_size(230.0)
+            .exact_size(SIDEBAR_WIDTH)
             .show(ui, |ui| {
                 ui.add_space(6.0);
                 ui.heading("Perseverance");
@@ -332,23 +339,29 @@ impl App {
 
                 match self.latest_sol {
                     Some(latest) => {
-                        // The slider's value box accepts typing, so the exact
-                        // sol is still reachable without dragging.
-                        let mut value = self.filters.sol.unwrap_or(latest).clamp(0, latest);
-                        let changed = ui
-                            .add(egui::Slider::new(&mut value, 0..=latest).step_by(1.0))
-                            .changed();
-                        if changed {
-                            self.filters.sol = Some(value);
-                        }
-
                         ui.horizontal(|ui| {
-                            if self.filters.sol.is_some() {
-                                if ui.button("All sols").clicked() {
-                                    self.filters.sol = None;
-                                }
-                            } else {
-                                ui.label(RichText::new("all sols").weak().small());
+                            // Leave room for the button beside it rather than
+                            // pushing it onto a row of its own.
+                            ui.spacing_mut().slider_width = SOL_SLIDER_WIDTH;
+
+                            // The slider's value box accepts typing, so the
+                            // exact sol is still reachable without dragging.
+                            let mut value = self.filters.sol.unwrap_or(latest).clamp(0, latest);
+                            let changed = ui
+                                .add(egui::Slider::new(&mut value, 0..=latest).step_by(1.0))
+                                .changed();
+                            if changed {
+                                self.filters.sol = Some(value);
+                            }
+
+                            // Always drawn, so the row does not reflow when a
+                            // sol is picked or cleared.
+                            let filtered = self.filters.sol.is_some();
+                            if ui
+                                .add_enabled(filtered, egui::Button::new("All sols"))
+                                .clicked()
+                            {
+                                self.filters.sol = None;
                             }
                         });
                     }
@@ -1405,6 +1418,34 @@ mod tests {
     }
 
     #[test]
+    fn the_sol_control_and_its_button_share_one_row_inside_the_sidebar() {
+        let (mut app, dir) = test_app_thumbs_only(&["A"]);
+        app.latest_sol = Some(1965);
+        app.filters.sol = Some(1000);
+
+        let mut harness =
+            egui_kittest::Harness::new_ui_state(|ui, app: &mut App| app.ui_impl(ui), app);
+        settle(&mut harness);
+
+        let button = harness.get_by_label("All sols").rect();
+
+        // On its own row the button would start at the sidebar's left margin.
+        assert!(
+            button.min.x > SOL_SLIDER_WIDTH,
+            "button wrapped onto its own row, starting at x={}",
+            button.min.x
+        );
+        // And it must not be pushed out past the sidebar to achieve that.
+        assert!(
+            button.max.x <= SIDEBAR_WIDTH,
+            "button overflows the sidebar: ends at x={} of {SIDEBAR_WIDTH}",
+            button.max.x
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn full_resolution_progress_is_reported_only_for_the_open_image() {
         let (mut app, dir) = test_app_thumbs_only(&["A"]);
 
@@ -1812,7 +1853,6 @@ mod tests {
             "Sol",
             "(Martian day; 0 is landing)",
             "All sols",
-            "all sols",
             "waiting for the first results",
             "Order",
             "Cameras",
