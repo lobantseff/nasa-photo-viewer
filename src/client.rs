@@ -110,8 +110,9 @@ impl Client {
         Ok(detail.image.into_iter().next())
     }
 
-    /// Download an image URL to `path`, returning the number of bytes written.
-    pub async fn download(&self, url: &str, path: &Path) -> Result<u64> {
+    /// Fetch raw bytes from an absolute URL (image renditions live on a
+    /// different host than the feed).
+    pub async fn fetch_bytes(&self, url: &str) -> Result<Vec<u8>> {
         let resp = self
             .http
             .get(url)
@@ -128,6 +129,12 @@ impl Client {
             .bytes()
             .await
             .with_context(|| format!("reading body of {url}"))?;
+        Ok(bytes.to_vec())
+    }
+
+    /// Download an image URL to `path`, returning the number of bytes written.
+    pub async fn download(&self, url: &str, path: &Path) -> Result<u64> {
+        let bytes = self.fetch_bytes(url).await?;
 
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()

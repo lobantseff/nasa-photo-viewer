@@ -43,7 +43,7 @@ pub const MARS2020_CAMERAS: &[&str] = &[
     "LCAM",
 ];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum Order {
     /// Newest sol first.
     #[default]
@@ -107,6 +107,27 @@ impl Query {
             page,
             ..self.clone()
         }
+    }
+
+    /// Stable identity of this query's *filters*, excluding pagination.
+    ///
+    /// Used to key cached listings, so page 0 and page 3 of the same search
+    /// share an entry family while a different filter never reads them.
+    pub fn cache_key(&self) -> String {
+        let cameras = self.cameras.join("|");
+        format!(
+            "{CATEGORY}|{}|{}|{}|{}|{}|{}",
+            self.order.as_str(),
+            self.effective_num(),
+            cameras,
+            self.min_sol.map(|v| v.to_string()).unwrap_or_default(),
+            self.max_sol.map(|v| v.to_string()).unwrap_or_default(),
+            format_args!(
+                "{}..{}",
+                self.taken_after.as_deref().unwrap_or(""),
+                self.taken_before.as_deref().unwrap_or("")
+            ),
+        )
     }
 
     /// Query-string parameters, in stable order.
@@ -284,5 +305,41 @@ mod tests {
 
         assert_eq!(lookup(&params, "id").as_deref(), Some("ABC_123"));
         assert_eq!(lookup(&params, "category").as_deref(), Some("mars2020"));
+    }
+
+    #[test]
+    fn cache_key_ignores_pagination_but_tracks_filters() {
+        let base = Query {
+            min_sol: Some(10),
+            ..Query::default()
+        };
+
+        // Paging through one search must reuse the same cache family.
+        assert_eq!(base.cache_key(), base.with_page(7).cache_key());
+
+        for variant in [
+            Query {
+                min_sol: Some(11),
+                ..base.clone()
+            },
+            Query {
+                cameras: vec!["NAVCAM_LEFT".into()],
+                ..base.clone()
+            },
+            Query {
+                order: Order::SolAsc,
+                ..base.clone()
+            },
+            Query {
+                taken_after: Some("2026-01-01".into()),
+                ..base.clone()
+            },
+        ] {
+            assert_ne!(
+                base.cache_key(),
+                variant.cache_key(),
+                "filters must not collide in the cache"
+            );
+        }
     }
 }

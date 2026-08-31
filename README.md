@@ -1,7 +1,32 @@
 # nasa-photo-viewer
 
-A typed Rust client and CLI for the raw-image feed behind
+A fast desktop browser (egui) for Perseverance raw images from
 <https://mars.nasa.gov/mars2020/multimedia/raw-images/>.
+
+The NASA page is slow because every navigation re-fetches listings and
+images. This app caches listing metadata in SQLite and image bytes on disk,
+so repeat browsing is instant and works offline.
+
+## Features
+
+- Thumbnail gallery with infinite scroll and background prefetch
+- Zoom (cursor-anchored) and drag-to-pan detail view
+- 1200px preview loads immediately; full-resolution PNG on demand
+- Filter by sol and camera; sort newest/oldest/by capture date
+- Local caching: SQLite for metadata, disk for images, ~2 GiB LRU budget
+- Works offline against anything previously browsed
+- Remembers window size and last filters
+
+## Running
+
+```bash
+cargo run --release
+```
+
+Keyboard: `←`/`→` step between images, `Esc` returns to the gallery.
+
+The cache lives in the platform cache directory (on macOS,
+`~/Library/Caches/dev.npv.nasa-photo-viewer`). Deleting it is safe.
 
 ## The API
 
@@ -71,21 +96,9 @@ These are the behaviours this client exists to absorb:
 - **Undocumented and unversioned.** `type` is the only version signal, and NASA
   can change any of the above without notice.
 
-## CLI
-
-```bash
-cargo run -- list --limit 5
-cargo run -- list --sol 1000 --camera navcam_left --limit 10
-cargo run -- list --after 2026-08-01 --before 2026-08-05 --limit 20
-cargo run -- get NLF_1000_0755730345_897ECM_N0474404NCAM00501_01_295J
-cargo run -- download --sol 1000 --camera mcz_left --size large --out ./downloads
-cargo run -- cameras
-```
-
-`list` and `download` page automatically until `--limit` is satisfied or the
-feed is exhausted. Add `--json` to `list` or `get` for raw output.
-
 ## Library
+
+The feed client is usable on its own:
 
 ```rust
 use nasa_photo_viewer::{Client, ImageSize, Query};
@@ -105,8 +118,10 @@ for image in client.list_all(&query, 50).await? {
 cargo test
 ```
 
-Tests are offline: parsing is checked against a recorded response in
-`tests/fixtures/list_page.json`, and query building is asserted directly.
+Tests never touch the network. Parsing is checked against a recorded
+response in `tests/fixtures/list_page.json`; the offline fallback is exercised
+by pointing the client at a refused port; and the UI (thumbnail clicks,
+keyboard navigation) is driven through `egui_kittest`.
 
 ## Courtesy
 
