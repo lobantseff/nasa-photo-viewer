@@ -8,7 +8,7 @@ use crate::cache::Cache;
 use crate::fetch::{Fetcher, ImageKind, Update};
 use crate::model::{Image, ImageSize};
 use crate::query::{MARS2020_CAMERAS, MAX_PAGE_SIZE, Order, Query};
-use crate::viewer::{Gesture, ZoomPan, cursor_for, gesture_from};
+use crate::viewer::{Gesture, ZoomPan, cursor_for, gesture_from, should_upgrade_to_full_res};
 
 const THUMB_SIZE: f32 = 150.0;
 
@@ -77,7 +77,10 @@ pub struct App {
     textures: HashMap<String, TextureHandle>,
     selected: Option<usize>,
     zoom: ZoomPan,
-    full_res_shown: bool,
+    /// Size of the texture drawn last frame, so a resolution swap can keep the
+    /// picture the same size on screen.
+    shown_size: Option<Vec2>,
+    full_res_pending: bool,
     error: Option<String>,
     serving_stale: bool,
 }
@@ -111,7 +114,8 @@ impl App {
             textures: HashMap::new(),
             selected: None,
             zoom: ZoomPan::default(),
-            full_res_shown: false,
+            shown_size: None,
+            full_res_pending: false,
             error: None,
             serving_stale: false,
         })
@@ -186,7 +190,7 @@ impl App {
                 }
                 Update::Image { url, image, kind } => {
                     if kind == ImageKind::Full {
-                        self.full_res_shown = true;
+                        self.full_res_pending = false;
                     }
                     let handle = ctx.load_texture(url.clone(), *image, TextureOptions::LINEAR);
                     self.textures.insert(url, handle);
@@ -445,7 +449,8 @@ impl App {
     fn select(&mut self, idx: usize) {
         self.selected = Some(idx);
         self.zoom.reset();
-        self.full_res_shown = false;
+        self.shown_size = None;
+        self.full_res_pending = false;
         if let Some(url) = self.images[idx].url_for(ImageSize::Large)
             && !self.textures.contains_key(url)
         {
@@ -486,13 +491,13 @@ impl App {
             ui.separator();
             let full_url = image.url_for(ImageSize::FullRes).map(|s| s.to_string());
             if let Some(full) = full_url.clone() {
-                let loaded = self.textures.contains_key(&full);
-                if !loaded {
-                    if ui.button("Load full resolution").clicked() {
-                        self.fetcher.request_image(&full, ImageKind::Full);
-                    }
-                } else {
+                // Full resolution now arrives on its own once zoomed in; this
+                // only reports where that has got to.
+                if self.textures.contains_key(&full) {
                     ui.label(RichText::new("full resolution").italics());
+                } else if self.full_res_pending {
+                    ui.spinner();
+                    ui.label(RichText::new("loading full resolution").italics());
                 }
 
                 if ui.button("Save…").clicked() {
@@ -534,12 +539,30 @@ impl App {
         };
 
         let img_size = texture.size_vec2();
+        if let Some(previous) = self.shown_size
+            && previous != img_size
+            && !self.zoom.needs_fit
+        {
+            self.zoom.preserve_apparent_size(previous, img_size);
+        }
+        self.shown_size = Some(img_size);
+
         if self.zoom.needs_fit {
             self.zoom.fit(img_size, viewport.size());
         } else {
             // The floor moves when the window resizes or a higher-resolution
             // rendition replaces the preview.
             self.zoom.set_bounds(img_size, viewport.size());
+        }
+
+        // Once the preview is magnified past its own pixels it looks soft, so
+        // pull the original in automatically rather than making the user ask.
+        if let Some(full) = full.as_ref()
+            && should_upgrade_to_full_res(self.zoom.scale, self.zoom.min_scale())
+            && !self.textures.contains_key(full)
+        {
+            self.full_res_pending = true;
+            self.fetcher.request_image(full, ImageKind::Full);
         }
 
         let pannable = self.zoom.is_pannable(img_size, viewport.size());
@@ -713,6 +736,17 @@ mod tests {
     use crate::cache::{Cache, DEFAULT_CACHE_BUDGET};
     use egui_kittest::kittest::Queryable as _;
 
+    fn full_res_url(id: &str) -> String {
+        format!("https://x/{id}_full.png")
+    }
+
+    fn png_bytes(w: u32, h: u32) -> Vec<u8> {
+        let img = image::RgbaImage::from_pixel(w, h, image::Rgba([200, 200, 200, 255]));
+        let mut buf = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut buf, image::ImageFormat::Png).unwrap();
+        buf.into_inner()
+    }
+
     /// Build an app with pre-seeded images and textures, so rendering it
     /// performs no network access.
     fn test_app(ids: &[&str]) -> (App, std::path::PathBuf) {
@@ -726,6 +760,14 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         let cache = Cache::open_at(&dir, DEFAULT_CACHE_BUDGET).unwrap();
+        // Pre-cache the full-resolution bytes so the automatic upgrade
+        // resolves locally and the tests stay offline.
+        for id in ids {
+            cache
+                .put_blob(&full_res_url(id), &png_bytes(128, 128))
+                .unwrap();
+        }
+
         let ctx = egui::Context::default();
         let mut app = App::build(ctx.clone(), cache, Filters::default()).unwrap();
 
@@ -739,6 +781,7 @@ mod tests {
                     "image_files": {
                         "small": format!("https://x/{id}_320.jpg"),
                         "large": format!("https://x/{id}_1200.jpg"),
+                        "full_res": full_res_url(id),
                     },
                 }))
                 .unwrap()
@@ -776,7 +819,7 @@ mod tests {
         let (app, dir) = test_app(&["ALPHA", "BETA"]);
         let mut harness =
             egui_kittest::Harness::new_ui_state(|ui, app: &mut App| app.ui_impl(ui), app);
-        harness.run();
+        settle(&mut harness);
 
         assert_eq!(
             harness.state().selected,
@@ -785,7 +828,7 @@ mod tests {
         );
 
         harness.get_by_label("BETA").click();
-        harness.run();
+        settle(&mut harness);
 
         // Regression: the thumbnail used to swallow its own click, so the
         // detail view could never be opened.
@@ -799,15 +842,15 @@ mod tests {
         let (app, dir) = test_app(&["ALPHA"]);
         let mut harness =
             egui_kittest::Harness::new_ui_state(|ui, app: &mut App| app.ui_impl(ui), app);
-        harness.run();
+        settle(&mut harness);
 
         harness.get_by_label("ALPHA").click();
-        harness.run();
+        settle(&mut harness);
 
         // Zoom well past "fit" so the image is much larger than its viewport.
         harness.state_mut().zoom.needs_fit = false;
         harness.state_mut().zoom.scale = 25.0;
-        harness.run();
+        settle(&mut harness);
 
         let toolbar = harness.get_by_label("Fit").rect();
 
@@ -829,12 +872,20 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Advance a bounded number of frames.
+    ///
+    /// `Harness::run` waits for the UI to go idle, which never happens while a
+    /// loading spinner is animating.
+    fn settle(harness: &mut egui_kittest::Harness<'_, App>) {
+        harness.run_steps(8);
+    }
+
     /// Hover over the middle of the image area, below the toolbar.
     fn hover_image_area(harness: &mut egui_kittest::Harness<'_, App>) -> egui::Pos2 {
         let toolbar = harness.get_by_label("Fit").rect();
         let pos = egui::pos2(toolbar.center().x + 200.0, toolbar.max.y + 250.0);
         harness.hover_at(pos);
-        harness.run();
+        settle(harness);
         pos
     }
 
@@ -843,16 +894,16 @@ mod tests {
         let (app, dir) = test_app(&["ALPHA"]);
         let mut harness =
             egui_kittest::Harness::new_ui_state(|ui, app: &mut App| app.ui_impl(ui), app);
-        harness.run();
+        settle(&mut harness);
         harness.get_by_label("ALPHA").click();
-        harness.run();
+        settle(&mut harness);
 
         hover_image_area(&mut harness);
         let before = harness.state().zoom.scale;
 
         // egui reports a trackpad pinch as a Zoom event.
         harness.event(egui::Event::Zoom(2.0));
-        harness.run();
+        settle(&mut harness);
 
         assert!(
             harness.state().zoom.scale > before,
@@ -864,13 +915,62 @@ mod tests {
     }
 
     #[test]
+    fn zooming_in_requests_the_full_resolution_image_automatically() {
+        // Only the preview renditions have textures; the original is cached
+        // as bytes but not yet decoded.
+        let (app, dir) = test_app(&["ALPHA"]);
+        let mut harness =
+            egui_kittest::Harness::new_ui_state(|ui, app: &mut App| app.ui_impl(ui), app);
+        settle(&mut harness);
+        harness.get_by_label("ALPHA").click();
+        settle(&mut harness);
+
+        // Opening alone must not pull a multi-megabyte original.
+        assert!(
+            !harness.state().full_res_pending,
+            "opening an image should not fetch full resolution"
+        );
+
+        hover_image_area(&mut harness);
+        harness.state_mut().zoom.needs_fit = false;
+        harness.state_mut().zoom.scale = 8.0;
+        settle(&mut harness);
+
+        assert!(
+            harness.state().full_res_pending,
+            "magnifying the preview should fetch the original"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_load_full_resolution_button_is_gone() {
+        let (app, dir) = test_app(&["ALPHA"]);
+        let mut harness =
+            egui_kittest::Harness::new_ui_state(|ui, app: &mut App| app.ui_impl(ui), app);
+        settle(&mut harness);
+        harness.get_by_label("ALPHA").click();
+        settle(&mut harness);
+
+        assert!(
+            harness.query_by_label("Load full resolution").is_none(),
+            "the manual button should have been replaced by automatic loading"
+        );
+        // The save action must survive the removal.
+        assert!(harness.query_by_label("Save\u{2026}").is_some());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn a_mouse_wheel_zooms_the_image() {
         let (app, dir) = test_app(&["ALPHA"]);
         let mut harness =
             egui_kittest::Harness::new_ui_state(|ui, app: &mut App| app.ui_impl(ui), app);
-        harness.run();
+        settle(&mut harness);
         harness.get_by_label("ALPHA").click();
-        harness.run();
+        settle(&mut harness);
 
         hover_image_area(&mut harness);
         let before = harness.state().zoom.scale;
@@ -882,7 +982,7 @@ mod tests {
             modifiers: egui::Modifiers::NONE,
             phase: egui::TouchPhase::Move,
         });
-        harness.run();
+        settle(&mut harness);
 
         assert!(
             harness.state().zoom.scale > before,
@@ -898,16 +998,16 @@ mod tests {
         let (app, dir) = test_app(&["ALPHA"]);
         let mut harness =
             egui_kittest::Harness::new_ui_state(|ui, app: &mut App| app.ui_impl(ui), app);
-        harness.run();
+        settle(&mut harness);
         harness.get_by_label("ALPHA").click();
-        harness.run();
+        settle(&mut harness);
 
         hover_image_area(&mut harness);
 
         // Zoom in first, otherwise the image fits and panning is pinned.
         harness.state_mut().zoom.needs_fit = false;
         harness.state_mut().zoom.scale = 20.0;
-        harness.run();
+        settle(&mut harness);
         let before = harness.state().zoom.offset;
 
         harness.event(egui::Event::MouseWheel {
@@ -916,7 +1016,7 @@ mod tests {
             modifiers: egui::Modifiers::NONE,
             phase: egui::TouchPhase::Move,
         });
-        harness.run();
+        settle(&mut harness);
 
         assert_ne!(
             harness.state().zoom.offset,
@@ -932,9 +1032,9 @@ mod tests {
         let (app, dir) = test_app(&["ALPHA"]);
         let mut harness =
             egui_kittest::Harness::new_ui_state(|ui, app: &mut App| app.ui_impl(ui), app);
-        harness.run();
+        settle(&mut harness);
         harness.get_by_label("ALPHA").click();
-        harness.run();
+        settle(&mut harness);
 
         hover_image_area(&mut harness);
 
@@ -944,7 +1044,7 @@ mod tests {
             modifiers: egui::Modifiers::NONE,
             phase: egui::TouchPhase::Move,
         });
-        harness.run();
+        settle(&mut harness);
 
         // The test image fits, so it stays pinned to the centre.
         assert_eq!(harness.state().zoom.offset, egui::Vec2::ZERO);
@@ -957,14 +1057,14 @@ mod tests {
         let (app, dir) = test_app(&["ALPHA", "BETA"]);
         let mut harness =
             egui_kittest::Harness::new_ui_state(|ui, app: &mut App| app.ui_impl(ui), app);
-        harness.run();
+        settle(&mut harness);
 
         harness.get_by_label("ALPHA").click();
-        harness.run();
+        settle(&mut harness);
         assert_eq!(harness.state().selected, Some(0));
 
         harness.key_press(egui::Key::Escape);
-        harness.run();
+        settle(&mut harness);
         assert_eq!(harness.state().selected, None);
 
         std::fs::remove_dir_all(&dir).ok();
@@ -975,22 +1075,22 @@ mod tests {
         let (app, dir) = test_app(&["ALPHA", "BETA", "GAMMA"]);
         let mut harness =
             egui_kittest::Harness::new_ui_state(|ui, app: &mut App| app.ui_impl(ui), app);
-        harness.run();
+        settle(&mut harness);
 
         harness.get_by_label("ALPHA").click();
-        harness.run();
+        settle(&mut harness);
 
         harness.key_press(egui::Key::ArrowRight);
-        harness.run();
+        settle(&mut harness);
         assert_eq!(harness.state().selected, Some(1));
 
         harness.key_press(egui::Key::ArrowLeft);
-        harness.run();
+        settle(&mut harness);
         assert_eq!(harness.state().selected, Some(0));
 
         // Must not step past the start of the list.
         harness.key_press(egui::Key::ArrowLeft);
-        harness.run();
+        settle(&mut harness);
         assert_eq!(harness.state().selected, Some(0));
 
         std::fs::remove_dir_all(&dir).ok();

@@ -11,7 +11,8 @@ so repeat browsing is instant and works offline.
 
 - Thumbnail gallery with infinite scroll and background prefetch
 - Zoom (cursor-anchored) and drag-to-pan detail view
-- 1200px preview loads immediately; full-resolution PNG on demand
+- 1200px preview loads immediately; the full-resolution PNG is fetched
+  automatically once you zoom past it
 - Filter by sol and camera; sort newest/oldest/by capture date
 - Local caching: SQLite for metadata, disk for images, ~2 GiB LRU budget
 - Works offline against anything previously browsed

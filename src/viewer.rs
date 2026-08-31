@@ -111,6 +111,18 @@ impl ZoomPan {
         Rect::from_center_size(viewport.center() + self.offset, scaled)
     }
 
+    /// Keep the image the same size on screen when its texture is replaced by
+    /// one of a different resolution.
+    ///
+    /// `scale` is relative to the source pixels, so swapping a 1200px preview
+    /// for the full-resolution original would otherwise make the picture jump
+    /// the moment the upgrade arrives.
+    pub fn preserve_apparent_size(&mut self, old: Vec2, new: Vec2) {
+        if old.x > 0.0 && new.x > 0.0 && old.is_finite() && new.is_finite() {
+            self.scale *= old.x / new.x;
+        }
+    }
+
     /// Whether any part of the image is currently off-screen.
     ///
     /// Drives both the grab cursor and whether drag gestures do anything: a
@@ -177,6 +189,18 @@ pub fn gesture_from(zoom_delta: f32, wheel_lines: f32, point_scroll: Vec2) -> Ge
     } else {
         Gesture::None
     }
+}
+
+/// Whether the preview is being magnified enough to warrant the
+/// full-resolution original.
+///
+/// The trigger is the preview being drawn larger than its own pixels, which is
+/// exactly when it starts to look soft. Merely opening an image never trips
+/// it, so the multi-megabyte original is fetched only once it would actually
+/// show more detail.
+pub fn should_upgrade_to_full_res(scale: f32, min_scale: f32) -> bool {
+    const EPS: f32 = 1e-4;
+    scale > min_scale + EPS && scale > 1.0 + EPS
 }
 
 /// Cursor to show over the image.
@@ -402,6 +426,55 @@ mod tests {
     #[test]
     fn a_degenerate_zoom_factor_is_ignored() {
         assert_eq!(gesture_from(0.0, 0.0, Vec2::ZERO), Gesture::None);
+    }
+
+    #[test]
+    fn full_res_is_requested_only_once_the_preview_is_magnified() {
+        // A large image opens fitted and downscaled: nothing to gain yet.
+        assert!(!should_upgrade_to_full_res(0.5, 0.5));
+        // Zoomed, but the preview is still being shrunk.
+        assert!(!should_upgrade_to_full_res(0.9, 0.5));
+        // Now drawn larger than its own pixels, so it looks soft.
+        assert!(should_upgrade_to_full_res(1.5, 0.5));
+    }
+
+    #[test]
+    fn opening_a_small_image_does_not_trigger_an_upgrade() {
+        // A small image opens at 1:1, which must not count as magnifying.
+        assert!(!should_upgrade_to_full_res(1.0, 1.0));
+        assert!(should_upgrade_to_full_res(1.4, 1.0));
+    }
+
+    #[test]
+    fn upgrading_the_texture_keeps_the_image_the_same_size_on_screen() {
+        let vp = viewport();
+        let preview = vec2(1200.0, 900.0);
+        let full = vec2(2400.0, 1800.0);
+
+        let mut zp = ZoomPan::default();
+        zp.fit(preview, vp.size());
+        zp.zoom_at(3.0, vp.center(), vp);
+        let before = zp.image_rect(preview, vp);
+
+        zp.preserve_apparent_size(preview, full);
+        let after = zp.image_rect(full, vp);
+
+        assert!(
+            (before.size() - after.size()).length() < 0.01,
+            "image jumped on upgrade: {:?} -> {:?}",
+            before.size(),
+            after.size()
+        );
+    }
+
+    #[test]
+    fn preserving_size_ignores_degenerate_dimensions() {
+        let mut zp = ZoomPan {
+            scale: 2.0,
+            ..Default::default()
+        };
+        zp.preserve_apparent_size(Vec2::ZERO, vec2(100.0, 100.0));
+        assert_eq!(zp.scale, 2.0);
     }
 
     #[test]
