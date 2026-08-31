@@ -151,18 +151,29 @@ pub enum Gesture {
     None,
 }
 
-/// Classify this frame's trackpad and wheel input.
+/// How much one wheel line magnifies. `exp` keeps successive ticks
+/// multiplicative, so zooming in then out returns to the original scale.
+const WHEEL_ZOOM_RATE: f32 = 0.15;
+
+/// Classify this frame's pointer input.
 ///
-/// Zoom wins over pan: egui reports a pinch as a zoom factor, and a trackpad
-/// pinch frequently carries a small incidental scroll that would otherwise
-/// make the image creep while magnifying.
-pub fn gesture_from(zoom_delta: f32, scroll: Vec2) -> Gesture {
+/// A mouse wheel and a trackpad swipe both arrive as scroll events, and are
+/// told apart by their unit: wheels report discrete `Line`s, trackpads report
+/// continuous `Point`s. That distinction is what lets a wheel zoom while a
+/// two-finger swipe pans.
+///
+/// Zoom wins over pan, because a trackpad pinch frequently carries a small
+/// incidental scroll that would otherwise make the image creep while
+/// magnifying.
+pub fn gesture_from(zoom_delta: f32, wheel_lines: f32, point_scroll: Vec2) -> Gesture {
     const ZOOM_EPS: f32 = 1e-4;
 
     if (zoom_delta - 1.0).abs() > ZOOM_EPS && zoom_delta > 0.0 {
         Gesture::Zoom(zoom_delta)
-    } else if scroll != Vec2::ZERO {
-        Gesture::Pan(scroll)
+    } else if wheel_lines != 0.0 {
+        Gesture::Zoom((wheel_lines * WHEEL_ZOOM_RATE).exp())
+    } else if point_scroll != Vec2::ZERO {
+        Gesture::Pan(point_scroll)
     } else {
         Gesture::None
     }
@@ -344,26 +355,53 @@ mod tests {
     }
 
     #[test]
-    fn a_pinch_is_read_as_zoom_and_a_scroll_as_pan() {
-        assert_eq!(gesture_from(1.5, Vec2::ZERO), Gesture::Zoom(1.5));
-        assert_eq!(gesture_from(0.5, Vec2::ZERO), Gesture::Zoom(0.5));
+    fn a_pinch_is_read_as_zoom_and_a_trackpad_swipe_as_pan() {
+        assert_eq!(gesture_from(1.5, 0.0, Vec2::ZERO), Gesture::Zoom(1.5));
+        assert_eq!(gesture_from(0.5, 0.0, Vec2::ZERO), Gesture::Zoom(0.5));
         assert_eq!(
-            gesture_from(1.0, vec2(3.0, -7.0)),
+            gesture_from(1.0, 0.0, vec2(3.0, -7.0)),
             Gesture::Pan(vec2(3.0, -7.0))
         );
-        assert_eq!(gesture_from(1.0, Vec2::ZERO), Gesture::None);
+        assert_eq!(gesture_from(1.0, 0.0, Vec2::ZERO), Gesture::None);
+    }
+
+    #[test]
+    fn a_mouse_wheel_zooms_rather_than_pans() {
+        // Wheels report whole lines; trackpads report points. Only the
+        // line-based ones should magnify.
+        let Gesture::Zoom(inward) = gesture_from(1.0, 1.0, Vec2::ZERO) else {
+            panic!("a wheel tick should zoom");
+        };
+        assert!(inward > 1.0, "scrolling up should zoom in, got {inward}");
+
+        let Gesture::Zoom(outward) = gesture_from(1.0, -1.0, Vec2::ZERO) else {
+            panic!("a wheel tick should zoom");
+        };
+        assert!(
+            outward < 1.0,
+            "scrolling down should zoom out, got {outward}"
+        );
+
+        // Opposite ticks must cancel exactly, or repeated in-and-out drifts.
+        assert!((inward * outward - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn a_wheel_tick_outranks_a_simultaneous_point_scroll() {
+        assert!(matches!(
+            gesture_from(1.0, 1.0, vec2(0.0, 5.0)),
+            Gesture::Zoom(_)
+        ));
     }
 
     #[test]
     fn a_pinch_carrying_incidental_scroll_still_zooms() {
-        // Trackpad pinches often report a little scroll alongside the zoom;
-        // panning at the same time would make the image creep.
-        assert_eq!(gesture_from(1.2, vec2(2.0, 2.0)), Gesture::Zoom(1.2));
+        assert_eq!(gesture_from(1.2, 0.0, vec2(2.0, 2.0)), Gesture::Zoom(1.2));
     }
 
     #[test]
     fn a_degenerate_zoom_factor_is_ignored() {
-        assert_eq!(gesture_from(0.0, Vec2::ZERO), Gesture::None);
+        assert_eq!(gesture_from(0.0, 0.0, Vec2::ZERO), Gesture::None);
     }
 
     #[test]

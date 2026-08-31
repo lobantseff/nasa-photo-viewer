@@ -27,10 +27,15 @@ Controls in the detail view:
 
 | Input | Action |
 | --- | --- |
+| Mouse wheel | Zoom about the pointer |
 | Trackpad pinch, or `Ctrl`+scroll | Zoom about the pointer |
-| Two-finger scroll, or drag | Pan a zoomed image |
+| Trackpad two-finger swipe, or drag | Pan a zoomed image |
 | `←` / `→` | Previous / next image |
 | `Esc` | Back to the gallery |
+
+A mouse wheel and a trackpad swipe are told apart by their scroll unit:
+wheels report discrete lines, trackpads report continuous points. A touch
+mouse that reports points, such as a Magic Mouse, therefore pans.
 
 Zoom stops once the whole image is visible; an image smaller than the
 window stops at 1:1 rather than being upscaled to fill it.

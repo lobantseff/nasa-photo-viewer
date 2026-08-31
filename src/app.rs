@@ -25,6 +25,9 @@ const STORAGE_KEY: &str = "npv_filters";
 ///
 /// egui's default fonts have no arrow glyphs (U+2190 and the emoji arrows all
 /// render as tofu), so this uses a guillemet, which they do provide.
+/// Lines a page-scroll stands for, on the rare device that reports pages.
+const PAGE_LINES: f32 = 10.0;
+
 const BACK_LABEL: &str = "\u{2039} Gallery";
 
 #[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -546,10 +549,24 @@ impl App {
         }
 
         if response.hovered() {
-            let (zoom_delta, scroll, pointer) =
-                ui.input(|i| (i.zoom_delta(), i.smooth_scroll_delta, i.pointer.hover_pos()));
+            let (zoom_delta, wheel_lines, point_scroll, pointer) = ui.input(|i| {
+                // Inspect raw events: the aggregated scroll delta has already
+                // discarded the unit that tells a wheel from a trackpad.
+                let mut lines = 0.0;
+                let mut points = Vec2::ZERO;
+                for event in &i.events {
+                    if let egui::Event::MouseWheel { unit, delta, .. } = event {
+                        match unit {
+                            egui::MouseWheelUnit::Line => lines += delta.y,
+                            egui::MouseWheelUnit::Page => lines += delta.y * PAGE_LINES,
+                            egui::MouseWheelUnit::Point => points += *delta,
+                        }
+                    }
+                }
+                (i.zoom_delta(), lines, points, i.pointer.hover_pos())
+            });
 
-            match gesture_from(zoom_delta, scroll) {
+            match gesture_from(zoom_delta, wheel_lines, point_scroll) {
                 Gesture::Zoom(factor) => {
                     let anchor = pointer.unwrap_or(viewport.center());
                     self.zoom.zoom_at(factor, anchor, viewport);
@@ -840,6 +857,36 @@ mod tests {
         assert!(
             harness.state().zoom.scale > before,
             "pinch should magnify: {before} -> {}",
+            harness.state().zoom.scale
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_mouse_wheel_zooms_the_image() {
+        let (app, dir) = test_app(&["ALPHA"]);
+        let mut harness =
+            egui_kittest::Harness::new_ui_state(|ui, app: &mut App| app.ui_impl(ui), app);
+        harness.run();
+        harness.get_by_label("ALPHA").click();
+        harness.run();
+
+        hover_image_area(&mut harness);
+        let before = harness.state().zoom.scale;
+
+        // A mouse wheel reports whole lines, unlike a trackpad's points.
+        harness.event(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: egui::vec2(0.0, 3.0),
+            modifiers: egui::Modifiers::NONE,
+            phase: egui::TouchPhase::Move,
+        });
+        harness.run();
+
+        assert!(
+            harness.state().zoom.scale > before,
+            "the mouse wheel should zoom in: {before} -> {}",
             harness.state().zoom.scale
         );
 
