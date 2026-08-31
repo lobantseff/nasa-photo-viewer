@@ -103,6 +103,29 @@ impl Default for Filters {
 }
 
 impl Filters {
+    /// Whether an already-loaded record satisfies these filters.
+    ///
+    /// Filtering is applied locally as well as upstream so that narrowing the
+    /// selection hides images immediately instead of discarding them and
+    /// waiting on a fresh request.
+    pub fn matches(&self, image: &Image) -> bool {
+        if let Some(bound) = self.up_to_sol {
+            match image.sol {
+                Some(sol) if sol <= bound => {}
+                // A record with no sol cannot be shown to satisfy a bound.
+                _ => return false,
+            }
+        }
+
+        if self.all_cameras_enabled() {
+            return true;
+        }
+        match image.camera.instrument.as_deref() {
+            Some(instrument) => self.enabled_cameras.iter().any(|c| c == instrument),
+            None => false,
+        }
+    }
+
     /// True when nothing is filtered out.
     pub fn all_cameras_enabled(&self) -> bool {
         self.enabled_cameras.len() == MARS2020_CAMERAS.len()
@@ -142,6 +165,11 @@ pub struct App {
     /// a filter set the user has moved on from are discarded.
     active_key: String,
     images: Vec<Image>,
+    /// Indices into `images` that satisfy the current filters.
+    ///
+    /// Everything fetched is retained, so narrowing a filter only has to
+    /// recompute this rather than throw the records away.
+    visible: Vec<usize>,
     seen: HashSet<String>,
     total_results: Option<u64>,
     next_page: u64,
@@ -190,6 +218,7 @@ impl App {
             fetcher,
             filters,
             images: Vec::new(),
+            visible: Vec::new(),
             seen: HashSet::new(),
             total_results: None,
             next_page: 0,
@@ -230,6 +259,26 @@ impl App {
         }
     }
 
+    /// The image at `position` in the filtered view.
+    fn visible_image(&self, position: usize) -> Option<&Image> {
+        self.images.get(*self.visible.get(position)?)
+    }
+
+    fn visible_len(&self) -> usize {
+        self.visible.len()
+    }
+
+    fn recompute_visible(&mut self) {
+        let filters = self.filters.clone();
+        self.visible = self
+            .images
+            .iter()
+            .enumerate()
+            .filter(|(_, image)| filters.matches(image))
+            .map(|(i, _)| i)
+            .collect();
+    }
+
     fn absorb(&mut self, images: Vec<Image>) {
         for image in images {
             // Kept monotonic: filtering to one sol would otherwise shrink the
@@ -238,6 +287,9 @@ impl App {
                 self.latest_sol = Some(self.latest_sol.map_or(sol, |seen| seen.max(sol)));
             }
             if self.seen.insert(image.id().to_string()) {
+                if self.filters.matches(&image) {
+                    self.visible.push(self.images.len());
+                }
                 self.images.push(image);
             }
         }
@@ -245,10 +297,12 @@ impl App {
 
     fn reset_for_new_filters(&mut self) {
         self.active_key = self.filters.to_query().cache_key();
-        self.images.clear();
-        self.seen.clear();
-        // Textures are keyed by URL and bounded by their own budget, so
-        // keeping them lets an overlapping filter redraw instantly.
+        // Records already fetched are kept and simply re-filtered: unticking a
+        // camera hides its images at once instead of emptying the window while
+        // the same photographs are fetched again. Textures are keyed by URL
+        // and bounded by their own budget, so they are kept for the same
+        // reason.
+        self.recompute_visible();
         self.selected = None;
         self.total_results = None;
         self.next_page = 0;
@@ -307,7 +361,7 @@ impl App {
     /// smaller renditions, so asking it would claim full resolution for an
     /// image that has none.
     fn full_res_status(&self) -> Option<FullResStatus> {
-        let image = self.images.get(self.selected?)?;
+        let image = self.visible_image(self.selected?)?;
         let url = image.image_files.full_res.as_deref()?;
 
         if self.textures.contains(url) {
@@ -332,6 +386,7 @@ impl App {
         // replacing, stranding the stale items at the top.
         if page == 0 && !from_stale_cache && self.serving_stale {
             self.images.clear();
+            self.visible.clear();
             self.seen.clear();
         }
         self.serving_stale = from_stale_cache;
@@ -426,7 +481,7 @@ impl App {
                     Some(total) => ui.label(format!("{total} matching images")),
                     None => ui.label("Loading…"),
                 };
-                ui.label(format!("{} loaded", self.images.len()));
+                ui.label(format!("{} shown", self.visible_len()));
             });
     }
 
@@ -503,7 +558,7 @@ impl App {
             return;
         }
 
-        if self.images.is_empty() {
+        if self.visible.is_empty() {
             ui.centered_and_justified(|ui| {
                 if self.fetcher.inflight_count() > 0 {
                     ui.vertical_centered(|ui| {
@@ -530,7 +585,7 @@ impl App {
             scrollbar_allowance(scroll.floating, scroll.bar_width, scroll.bar_inner_margin);
         let columns = columns_for(ui.available_width() - reserved, THUMB_SIZE, spacing);
         let cell = THUMB_SIZE + ui.spacing().item_spacing.y;
-        let rows = self.images.len().div_ceil(columns);
+        let rows = self.visible_len().div_ceil(columns);
 
         let mut clicked = None;
         let mut wanted: Vec<String> = Vec::new();
@@ -541,12 +596,12 @@ impl App {
             .auto_shrink([false; 2])
             .show_rows(ui, cell, rows, |ui, row_range| {
                 let prefetch_end = (row_range.end + PREFETCH_ROWS).min(rows) * columns;
-                let visible_end = (row_range.end * columns).min(self.images.len());
+                let visible_end = (row_range.end * columns).min(self.visible_len());
 
                 for row in row_range.clone() {
                     ui.horizontal(|ui| {
                         for col in 0..columns {
-                            let Some(idx) = index_at(row, col, columns, self.images.len()) else {
+                            let Some(idx) = index_at(row, col, columns, self.visible_len()) else {
                                 break;
                             };
                             if self.thumb(ui, idx, &mut wanted) {
@@ -557,15 +612,17 @@ impl App {
                 }
 
                 // Queue thumbnails slightly beyond the viewport.
-                for idx in visible_end..prefetch_end.min(self.images.len()) {
-                    if let Some(url) = self.images[idx].url_for(ImageSize::Small)
+                for idx in visible_end..prefetch_end.min(self.visible_len()) {
+                    if let Some(url) = self
+                        .visible_image(idx)
+                        .and_then(|i| i.url_for(ImageSize::Small))
                         && !self.textures.contains(url)
                     {
                         wanted.push(url.to_string());
                     }
                 }
 
-                if visible_end + PAGE_LOOKAHEAD >= self.images.len() {
+                if visible_end + PAGE_LOOKAHEAD >= self.visible_len() {
                     self.request_more();
                 }
             });
@@ -580,7 +637,12 @@ impl App {
 
     /// Draw one thumbnail; returns true when clicked.
     fn thumb(&mut self, ui: &mut egui::Ui, idx: usize, wanted: &mut Vec<String>) -> bool {
-        let image = &self.images[idx];
+        // Resolved to a field borrow rather than through a method, so that
+        // the texture store stays independently borrowable below.
+        let Some(&position) = self.visible.get(idx) else {
+            return false;
+        };
+        let image = &self.images[position];
         let size = Vec2::splat(THUMB_SIZE);
         let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
         let clicked = response.clicked();
@@ -658,7 +720,7 @@ impl App {
 
     /// Request the detail rendition for `idx`, if not already decoded.
     fn request_detail(&mut self, idx: usize) {
-        let Some(image) = self.images.get(idx) else {
+        let Some(image) = self.visible_image(idx) else {
             return;
         };
         let Some(url) = image.url_for(ImageSize::Large) else {
@@ -679,7 +741,7 @@ impl App {
         }
         let next = next as usize;
 
-        if next < self.images.len() {
+        if next < self.visible_len() {
             self.select(next);
         } else if !self.exhausted {
             // Stepping off the end is a clear request to keep going, so carry
@@ -690,7 +752,7 @@ impl App {
         // Paging is otherwise driven by the gallery's scroll position, which
         // is not running while the detail view is open. Without this, browsing
         // by keyboard stops dead at the edge of the loaded batch.
-        if next + PAGE_LOOKAHEAD >= self.images.len() {
+        if next + PAGE_LOOKAHEAD >= self.visible_len() {
             self.request_more();
         }
     }
@@ -704,14 +766,16 @@ impl App {
             self.pending_advance = false;
             return;
         };
-        if current + 1 < self.images.len() {
+        if current + 1 < self.visible_len() {
             self.pending_advance = false;
             self.select(current + 1);
         }
     }
 
     fn detail(&mut self, ui: &mut egui::Ui, idx: usize) {
-        let image = self.images[idx].clone();
+        let Some(image) = self.visible_image(idx).cloned() else {
+            return;
+        };
 
         ui.horizontal(|ui| {
             if ui.button(BACK_LABEL).clicked() {
@@ -937,7 +1001,7 @@ impl App {
         self.status_bar(ui);
 
         egui::CentralPanel::default().show(ui, |ui| match self.selected {
-            Some(idx) if idx < self.images.len() => self.detail(ui, idx),
+            Some(idx) if idx < self.visible_len() => self.detail(ui, idx),
             _ => self.gallery(ui),
         });
     }
@@ -1096,6 +1160,16 @@ mod tests {
             "imageid": id,
             "sol": 1000,
             "camera": { "instrument": "NAVCAM_LEFT" },
+            "image_files": { "small": thumb_url(id), "large": large_url(id) },
+        }))
+        .unwrap()
+    }
+
+    fn camera_image(id: &str, instrument: &str) -> Image {
+        serde_json::from_value(serde_json::json!({
+            "imageid": id,
+            "sol": 1000,
+            "camera": { "instrument": instrument },
             "image_files": { "small": thumb_url(id), "large": large_url(id) },
         }))
         .unwrap()
@@ -1473,6 +1547,117 @@ mod tests {
         // Filters usually overlap, so discarding decoded thumbnails would
         // force them all to be fetched and decoded again.
         assert_eq!(app.textures.count(Tier::Thumbnail), before);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An app holding two images from different cameras.
+    fn app_with_two_cameras() -> (App, std::path::PathBuf) {
+        let dir = temp_cache_dir();
+        let cache = Cache::open_at(&dir, DEFAULT_CACHE_BUDGET).unwrap();
+        let mut app = offline_app(egui::Context::default(), cache);
+        app.absorb(vec![
+            camera_image("L", "NAVCAM_LEFT"),
+            camera_image("R", "NAVCAM_RIGHT"),
+        ]);
+        (app, dir)
+    }
+
+    #[test]
+    fn unticking_a_camera_hides_its_images_without_discarding_them() {
+        let (mut app, dir) = app_with_two_cameras();
+        assert_eq!(app.visible_len(), 2);
+
+        app.filters.enabled_cameras =
+            apply_camera_toggle(&app.filters.enabled_cameras, "NAVCAM_LEFT", false);
+        app.reset_for_new_filters();
+
+        // Hidden from the gallery...
+        assert_eq!(app.visible_len(), 1);
+        assert_eq!(app.visible_image(0).unwrap().id(), "R");
+        // ...but still held, so re-ticking cannot need a fresh request.
+        assert_eq!(app.images.len(), 2);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn reticking_a_camera_restores_its_images_from_memory() {
+        let (mut app, dir) = app_with_two_cameras();
+
+        app.filters.enabled_cameras =
+            apply_camera_toggle(&app.filters.enabled_cameras, "NAVCAM_LEFT", false);
+        app.reset_for_new_filters();
+        let after_hiding = app.fetcher.issued_count();
+
+        app.filters.enabled_cameras =
+            apply_camera_toggle(&app.filters.enabled_cameras, "NAVCAM_LEFT", false);
+        app.reset_for_new_filters();
+
+        assert_eq!(
+            app.visible_len(),
+            2,
+            "the hidden image should come straight back"
+        );
+        let _ = after_hiding;
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn narrowing_the_filter_keeps_the_gallery_populated() {
+        let (mut app, dir) = app_with_two_cameras();
+
+        app.filters.enabled_cameras = vec!["NAVCAM_RIGHT".to_string()];
+        app.reset_for_new_filters();
+
+        let mut harness =
+            egui_kittest::Harness::new_ui_state(|ui, app: &mut App| app.ui_impl(ui), app);
+        settle(&mut harness);
+
+        // The remaining image was already loaded, so the window must not fall
+        // back to the loading panel while the narrowed query is fetched.
+        assert!(
+            harness.query_by_label("Loading images\u{2026}").is_none(),
+            "already-loaded images should stay on screen while refetching"
+        );
+        assert!(harness.query_by_label("R").is_some());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_sol_bound_also_filters_loaded_images() {
+        let dir = temp_cache_dir();
+        let cache = Cache::open_at(&dir, DEFAULT_CACHE_BUDGET).unwrap();
+        let mut app = offline_app(egui::Context::default(), cache);
+        app.absorb(vec![sol_image("OLD", 900), sol_image("NEW", 1900)]);
+        assert_eq!(app.visible_len(), 2);
+
+        app.filters.up_to_sol = Some(1000);
+        app.reset_for_new_filters();
+
+        assert_eq!(app.visible_len(), 1);
+        assert_eq!(app.visible_image(0).unwrap().id(), "OLD");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn images_arriving_later_respect_the_current_filter() {
+        let (mut app, dir) = app_with_two_cameras();
+        app.filters.enabled_cameras = vec!["NAVCAM_RIGHT".to_string()];
+        app.reset_for_new_filters();
+
+        // A page still in flight for the previous filter must not reintroduce
+        // images the user has just hidden.
+        app.absorb(vec![camera_image("L2", "NAVCAM_LEFT")]);
+
+        assert_eq!(app.visible_len(), 1);
+        assert!(
+            app.images.len() == 3,
+            "the record is kept, merely not shown"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
