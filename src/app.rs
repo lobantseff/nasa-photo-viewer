@@ -107,6 +107,8 @@ pub struct App {
     /// picture the same size on screen.
     shown_size: Option<Vec2>,
     full_res_pending: bool,
+    /// A right-arrow press that ran past the loaded batch, waiting on a page.
+    pending_advance: bool,
     detail_content: DetailContent,
     error: Option<String>,
     serving_stale: bool,
@@ -145,6 +147,7 @@ impl App {
             zoom: ZoomPan::default(),
             shown_size: None,
             full_res_pending: false,
+            pending_advance: false,
             detail_content: DetailContent::default(),
             error: None,
             serving_stale: false,
@@ -193,6 +196,7 @@ impl App {
         self.next_page = 0;
         self.exhausted = false;
         self.serving_stale = false;
+        self.pending_advance = false;
         self.error = None;
         self.prime_from_cache();
         self.request_more();
@@ -538,6 +542,7 @@ impl App {
 
     fn select(&mut self, idx: usize) {
         self.selected = Some(idx);
+        self.pending_advance = false;
         self.zoom.reset();
         self.shown_size = None;
         self.full_res_pending = false;
@@ -570,8 +575,39 @@ impl App {
     fn step_selection(&mut self, delta: isize) {
         let Some(current) = self.selected else { return };
         let next = current as isize + delta;
-        if next >= 0 && (next as usize) < self.images.len() {
-            self.select(next as usize);
+        if next < 0 {
+            return;
+        }
+        let next = next as usize;
+
+        if next < self.images.len() {
+            self.select(next);
+        } else if !self.exhausted {
+            // Stepping off the end is a clear request to keep going, so carry
+            // the intent until the next page lands.
+            self.pending_advance = true;
+        }
+
+        // Paging is otherwise driven by the gallery's scroll position, which
+        // is not running while the detail view is open. Without this, browsing
+        // by keyboard stops dead at the edge of the loaded batch.
+        if next + PAGE_LOOKAHEAD >= self.images.len() {
+            self.request_more();
+        }
+    }
+
+    /// Resume a step that ran off the end once more images have arrived.
+    fn resume_pending_advance(&mut self) {
+        if !self.pending_advance {
+            return;
+        }
+        let Some(current) = self.selected else {
+            self.pending_advance = false;
+            return;
+        };
+        if current + 1 < self.images.len() {
+            self.pending_advance = false;
+            self.select(current + 1);
         }
     }
 
@@ -785,6 +821,10 @@ impl App {
                 self.selected = None;
             }
         });
+        if self.selected.is_none() {
+            self.pending_advance = false;
+        }
+        self.resume_pending_advance();
         if self.selected.is_some() {
             let (prev, next) = ctx.input(|i| {
                 (
@@ -1277,6 +1317,91 @@ mod tests {
         // Filters usually overlap, so discarding decoded thumbnails would
         // force them all to be fetched and decoded again.
         assert_eq!(app.textures.count(Tier::Thumbnail), before);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn arrowing_off_the_end_asks_for_the_next_page() {
+        let (mut app, dir) = test_app_thumbs_only(&["A", "B", "C"]);
+        app.exhausted = false;
+        app.next_page = 1;
+
+        let mut harness =
+            egui_kittest::Harness::new_ui_state(|ui, app: &mut App| app.ui_impl(ui), app);
+        settle(&mut harness);
+        harness.get_by_label("C").click();
+        settle(&mut harness);
+
+        let before = harness.state().fetcher.issued_count();
+        harness.key_press(egui::Key::ArrowRight);
+        settle(&mut harness);
+
+        // Paging is driven by the gallery's scroll position, which does not
+        // run in the detail view; without this, keyboard browsing stops at
+        // the edge of the loaded batch.
+        assert!(
+            harness.state().fetcher.issued_count() > before,
+            "stepping past the last image should request more"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_step_past_the_end_resumes_when_the_page_arrives() {
+        let (mut app, dir) = test_app_thumbs_only(&["A", "B"]);
+        app.exhausted = false;
+        app.selected = Some(1);
+        app.pending_advance = true;
+
+        app.merge_listing(1, false, vec![test_image("C")], Some(3));
+        app.resume_pending_advance();
+
+        assert_eq!(
+            app.selected,
+            Some(2),
+            "browsing should carry on to the new image"
+        );
+        assert!(!app.pending_advance);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn leaving_the_viewer_cancels_a_queued_step() {
+        let (mut app, dir) = test_app_thumbs_only(&["A", "B"]);
+        app.exhausted = false;
+        app.selected = Some(1);
+        app.pending_advance = true;
+
+        // Back to the gallery: a page arriving later must not yank the user
+        // into an image they no longer had open.
+        app.selected = None;
+        let mut harness =
+            egui_kittest::Harness::new_ui_state(|ui, app: &mut App| app.ui_impl(ui), app);
+        settle(&mut harness);
+
+        harness
+            .state_mut()
+            .merge_listing(1, false, vec![test_image("C")], Some(3));
+        settle(&mut harness);
+
+        assert_eq!(harness.state().selected, None);
+        assert!(!harness.state().pending_advance);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn stepping_backwards_from_the_first_image_stays_put() {
+        let (mut app, dir) = test_app_thumbs_only(&["A", "B"]);
+        app.selected = Some(0);
+
+        app.step_selection(-1);
+
+        assert_eq!(app.selected, Some(0));
+        assert!(!app.pending_advance, "going back should never queue a step");
 
         std::fs::remove_dir_all(&dir).ok();
     }

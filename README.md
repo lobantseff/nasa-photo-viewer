@@ -37,7 +37,7 @@ Controls in the detail view:
 | Mouse wheel | Zoom about the pointer |
 | Trackpad pinch, or `Ctrl`+scroll | Zoom about the pointer |
 | Trackpad two-finger swipe, or drag | Pan a zoomed image |
-| `←` / `→` | Previous / next image |
+| `←` / `→` | Previous / next image, paging on past the loaded batch |
 | `Esc` | Back to the gallery |
 
 A mouse wheel and a trackpad swipe are told apart by their scroll unit:
