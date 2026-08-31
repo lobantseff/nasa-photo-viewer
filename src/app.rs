@@ -66,8 +66,9 @@ const PREFETCH_RADIUS: usize = 3;
 /// Width of the filter sidebar.
 const SIDEBAR_WIDTH: f32 = 230.0;
 
-/// Height of the scrollable camera list.
-const CAMERA_LIST_HEIGHT: f32 = 320.0;
+/// Smallest the camera list may become in a short window, below which
+/// scrolling it would be more awkward than the space it saves.
+const MIN_CAMERA_LIST_HEIGHT: f32 = 120.0;
 
 /// Width of the sol slider's track, narrowed from egui's default so the
 /// "Reset" button shares its row within the sidebar.
@@ -469,19 +470,25 @@ impl App {
                     }
                 });
 
+                // Claimed before the list, so the counts keep the foot of the
+                // sidebar and the list is measured against what is left.
+                let (total_results, shown) = (self.total_results, self.visible_len());
+                egui::Panel::bottom("filter_summary")
+                    .show_separator_line(false)
+                    .show(ui, |ui| {
+                        ui.separator();
+                        match total_results {
+                            Some(total) => ui.label(format!("{total} matching images")),
+                            None => ui.label("Loading…"),
+                        };
+                        ui.label(format!("{shown} shown"));
+                    });
+
                 camera_list(ui, &mut self.filters.enabled_cameras);
 
                 if self.filters != before {
                     self.reset_for_new_filters();
                 }
-
-                ui.add_space(12.0);
-                ui.separator();
-                match self.total_results {
-                    Some(total) => ui.label(format!("{total} matching images")),
-                    None => ui.label("Loading…"),
-                };
-                ui.label(format!("{} shown", self.visible_len()));
             });
     }
 
@@ -1034,14 +1041,32 @@ fn apply_camera_toggle(enabled: &[String], cam: &str, alt: bool) -> Vec<String> 
         .collect()
 }
 
+/// How the camera list ended up laid out.
+pub struct CameraListLayout {
+    /// Height the list was given on screen.
+    pub viewport_height: f32,
+    /// Height the checkboxes needed.
+    pub content_height: f32,
+}
+
+impl CameraListLayout {
+    /// Whether the list had to scroll to show every camera.
+    pub fn needs_scrolling(&self) -> bool {
+        self.content_height > self.viewport_height + 0.5
+    }
+}
+
 /// The scrollable list of camera checkboxes.
-fn camera_list(ui: &mut egui::Ui, enabled: &mut Vec<String>) {
-    egui::ScrollArea::vertical()
+fn camera_list(ui: &mut egui::Ui, enabled: &mut Vec<String>) -> CameraListLayout {
+    let output = egui::ScrollArea::vertical()
         // Fill the available width rather than shrinking to the widest camera
         // name, which strands the scroll bar mid-panel with dead space beside
         // it and lets the floating bar overlap the longest label.
         .auto_shrink([false, true])
-        .max_height(CAMERA_LIST_HEIGHT)
+        // Take the height the sidebar actually has rather than a fixed slice
+        // of it, which left the list scrolling with the panel half empty
+        // below it.
+        .max_height(ui.available_height().max(MIN_CAMERA_LIST_HEIGHT))
         .show(ui, |ui| {
             for cam in MARS2020_CAMERAS {
                 let mut on = enabled.iter().any(|c| c == cam);
@@ -1059,6 +1084,11 @@ fn camera_list(ui: &mut egui::Ui, enabled: &mut Vec<String>) {
                 });
             }
         });
+
+    CameraListLayout {
+        viewport_height: output.inner_rect.height(),
+        content_height: output.content_size.y,
+    }
 }
 
 /// Draw the connectivity dot.
@@ -1802,6 +1832,40 @@ mod tests {
         assert!(!enabled.iter().any(|c| c == "MCZ_LEFT"));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_camera_list_uses_the_height_it_is_given() {
+        let ctx = egui::Context::default();
+        let mut cameras: Vec<String> = Vec::new();
+
+        // Ample room: every camera should be reachable without scrolling,
+        // rather than the list keeping to a fixed slice of the sidebar and
+        // leaving the rest of the panel empty.
+        let mut roomy = None;
+        let mut cramped = None;
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            ui.allocate_ui(egui::vec2(230.0, 600.0), |ui| {
+                roomy = Some(camera_list(ui, &mut cameras));
+            });
+            ui.allocate_ui(egui::vec2(230.0, 150.0), |ui| {
+                cramped = Some(camera_list(ui, &mut cameras));
+            });
+        });
+        output.textures_delta.clear();
+
+        let roomy = roomy.unwrap();
+        assert!(
+            !roomy.needs_scrolling(),
+            "list still scrolled with {} of space for {} of cameras",
+            roomy.viewport_height,
+            roomy.content_height
+        );
+
+        // And it still yields when the window genuinely is short.
+        let cramped = cramped.unwrap();
+        assert!(cramped.needs_scrolling());
+        assert!(cramped.viewport_height <= roomy.viewport_height);
     }
 
     #[test]
