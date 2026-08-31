@@ -78,7 +78,7 @@ const PAGE_LINES: f32 = 10.0;
 
 const BACK_LABEL: &str = "\u{2039} Gallery";
 
-#[derive(Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Filters {
     /// Newest sol to show, or `None` to start from the latest.
     ///
@@ -86,10 +86,33 @@ pub struct Filters {
     /// here backwards, so the chosen sol is at the top and browsing continues
     /// into earlier ones instead of stopping at a day boundary.
     pub up_to_sol: Option<i64>,
-    pub cameras: Vec<String>,
+    /// Cameras whose images are shown.
+    ///
+    /// Every camera is enabled by default, so the checkboxes state what is on
+    /// screen rather than describing a filter that is not yet applied.
+    pub enabled_cameras: Vec<String>,
+}
+
+impl Default for Filters {
+    fn default() -> Self {
+        Self {
+            up_to_sol: None,
+            enabled_cameras: MARS2020_CAMERAS.iter().map(|c| (*c).to_string()).collect(),
+        }
+    }
 }
 
 impl Filters {
+    /// True when nothing is filtered out.
+    pub fn all_cameras_enabled(&self) -> bool {
+        self.enabled_cameras.len() == MARS2020_CAMERAS.len()
+    }
+
+    /// True when every camera is switched off, which can match nothing.
+    pub fn no_cameras_enabled(&self) -> bool {
+        self.enabled_cameras.is_empty()
+    }
+
     pub fn to_query(&self) -> Query {
         Query {
             num: MAX_PAGE_SIZE,
@@ -97,7 +120,13 @@ impl Filters {
             // Always newest-first: the slider sets where "newest" starts, so a
             // second ordering control would only contradict it.
             order: Order::SolDesc,
-            cameras: self.cameras.clone(),
+            // Every camera enabled is the same query as no camera filter,
+            // and the shorter request is the one the service answers fastest.
+            cameras: if self.all_cameras_enabled() {
+                Vec::new()
+            } else {
+                self.enabled_cameras.clone()
+            },
             min_sol: None,
             max_sol: self.up_to_sol,
             taken_after: None,
@@ -232,7 +261,7 @@ impl App {
     }
 
     fn request_more(&mut self) {
-        if self.exhausted {
+        if self.exhausted || self.filters.no_cameras_enabled() {
             return;
         }
         let query = self.filters.to_query();
@@ -375,12 +404,17 @@ impl App {
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
                     ui.label("Cameras");
-                    if !self.filters.cameras.is_empty() && ui.small_button("reset").clicked() {
-                        self.filters.cameras.clear();
+                    let filtered = !self.filters.all_cameras_enabled();
+                    if ui
+                        .add_enabled(filtered, egui::Button::new("All").small())
+                        .clicked()
+                    {
+                        self.filters.enabled_cameras =
+                            MARS2020_CAMERAS.iter().map(|c| (*c).to_string()).collect();
                     }
                 });
 
-                camera_list(ui, &mut self.filters.cameras);
+                camera_list(ui, &mut self.filters.enabled_cameras);
 
                 if self.filters != before {
                     self.reset_for_new_filters();
@@ -460,6 +494,15 @@ impl App {
     }
 
     fn gallery(&mut self, ui: &mut egui::Ui) {
+        // Switching every camera off can only match nothing, so say so rather
+        // than sending a query whose empty result looks like a failure.
+        if self.filters.no_cameras_enabled() {
+            ui.centered_and_justified(|ui| {
+                ui.label("Every camera is switched off.");
+            });
+            return;
+        }
+
         if self.images.is_empty() {
             ui.centered_and_justified(|ui| {
                 if self.fetcher.inflight_count() > 0 {
@@ -900,8 +943,35 @@ impl App {
     }
 }
 
+/// Apply a click on `cam` to the set of enabled cameras.
+///
+/// A plain click toggles that one camera. An alt-click isolates it instead,
+/// which saves switching off fifteen others to look at one; alt-clicking the
+/// camera that is already alone inverts the selection, so the same gesture
+/// both enters and leaves the isolated view.
+fn apply_camera_toggle(enabled: &[String], cam: &str, alt: bool) -> Vec<String> {
+    let is_alone = enabled.len() == 1 && enabled[0] == cam;
+
+    let keep: Box<dyn Fn(&str) -> bool> = if alt && is_alone {
+        Box::new(move |c| c != cam)
+    } else if alt {
+        Box::new(move |c| c == cam)
+    } else if enabled.iter().any(|c| c == cam) {
+        Box::new(move |c| c != cam && enabled.iter().any(|e| e == c))
+    } else {
+        Box::new(move |c| c == cam || enabled.iter().any(|e| e == c))
+    };
+
+    // Rebuilt in canonical order so the set never depends on click history.
+    MARS2020_CAMERAS
+        .iter()
+        .filter(|c| keep(c))
+        .map(|c| (*c).to_string())
+        .collect()
+}
+
 /// The scrollable list of camera checkboxes.
-fn camera_list(ui: &mut egui::Ui, selected: &mut Vec<String>) {
+fn camera_list(ui: &mut egui::Ui, enabled: &mut Vec<String>) {
     egui::ScrollArea::vertical()
         // Fill the available width rather than shrinking to the widest camera
         // name, which strands the scroll bar mid-panel with dead space beside
@@ -910,14 +980,19 @@ fn camera_list(ui: &mut egui::Ui, selected: &mut Vec<String>) {
         .max_height(CAMERA_LIST_HEIGHT)
         .show(ui, |ui| {
             for cam in MARS2020_CAMERAS {
-                let mut on = selected.iter().any(|c| c == cam);
-                if ui.checkbox(&mut on, *cam).changed() {
-                    if on {
-                        selected.push((*cam).to_string());
-                    } else {
-                        selected.retain(|c| c != cam);
-                    }
+                let mut on = enabled.iter().any(|c| c == cam);
+                let response = ui.checkbox(&mut on, *cam);
+                if response.clicked() {
+                    // The checkbox has already flipped `on`; the decision is
+                    // made from the stored set, so that is discarded.
+                    let alt = ui.input(|i| i.modifiers.alt);
+                    *enabled = apply_camera_toggle(enabled, cam, alt);
                 }
+                response.on_hover_text(if enabled.len() == 1 && enabled[0] == *cam {
+                    "Alt-click to show every other camera"
+                } else {
+                    "Alt-click to show only this camera"
+                });
             }
         });
 }
@@ -1403,6 +1478,148 @@ mod tests {
     }
 
     #[test]
+    fn every_camera_starts_enabled() {
+        let f = Filters::default();
+
+        // The checkboxes describe what is on screen, so with everything shown
+        // they must all be ticked.
+        assert_eq!(f.enabled_cameras.len(), MARS2020_CAMERAS.len());
+        assert!(f.all_cameras_enabled());
+        // All enabled is the same query as no camera filter.
+        assert!(f.to_query().cameras.is_empty());
+    }
+
+    #[test]
+    fn unticking_a_camera_filters_it_out() {
+        let all: Vec<String> = MARS2020_CAMERAS.iter().map(|c| c.to_string()).collect();
+
+        let without = apply_camera_toggle(&all, "SKYCAM", false);
+
+        assert_eq!(without.len(), MARS2020_CAMERAS.len() - 1);
+        assert!(!without.iter().any(|c| c == "SKYCAM"));
+
+        // And ticking it again restores it.
+        let restored = apply_camera_toggle(&without, "SKYCAM", false);
+        assert_eq!(restored, all);
+    }
+
+    #[test]
+    fn alt_click_isolates_a_single_camera() {
+        let all: Vec<String> = MARS2020_CAMERAS.iter().map(|c| c.to_string()).collect();
+
+        let only = apply_camera_toggle(&all, "NAVCAM_LEFT", true);
+
+        assert_eq!(only, vec!["NAVCAM_LEFT".to_string()]);
+    }
+
+    #[test]
+    fn alt_click_on_an_isolated_camera_inverts_the_selection() {
+        let only = vec!["NAVCAM_LEFT".to_string()];
+
+        let inverted = apply_camera_toggle(&only, "NAVCAM_LEFT", true);
+
+        // The same gesture leaves the isolated view as entered it.
+        assert_eq!(inverted.len(), MARS2020_CAMERAS.len() - 1);
+        assert!(!inverted.iter().any(|c| c == "NAVCAM_LEFT"));
+    }
+
+    #[test]
+    fn alt_click_on_another_camera_moves_the_isolation() {
+        let only = vec!["NAVCAM_LEFT".to_string()];
+
+        // Not the isolated one, so this isolates rather than inverting.
+        let moved = apply_camera_toggle(&only, "MCZ_RIGHT", true);
+
+        assert_eq!(moved, vec!["MCZ_RIGHT".to_string()]);
+    }
+
+    #[test]
+    fn the_enabled_set_keeps_a_canonical_order() {
+        let scrambled = vec!["SKYCAM".to_string(), "NAVCAM_LEFT".to_string()];
+
+        let toggled = apply_camera_toggle(&scrambled, "MCZ_LEFT", false);
+
+        // Order follows the camera list, not the order things were clicked.
+        let expected: Vec<String> = MARS2020_CAMERAS
+            .iter()
+            .filter(|c| ["NAVCAM_LEFT", "MCZ_LEFT", "SKYCAM"].contains(c))
+            .map(|c| c.to_string())
+            .collect();
+        assert_eq!(toggled, expected);
+    }
+
+    #[test]
+    fn unticking_the_last_camera_is_allowed_but_queries_nothing() {
+        let one = vec!["SKYCAM".to_string()];
+
+        let none = apply_camera_toggle(&one, "SKYCAM", false);
+
+        assert!(none.is_empty());
+        let f = Filters {
+            enabled_cameras: none,
+            ..Filters::default()
+        };
+        assert!(f.no_cameras_enabled());
+    }
+
+    #[test]
+    fn no_request_is_made_when_every_camera_is_off() {
+        let (mut app, dir) = test_app_thumbs_only(&["A"]);
+        app.exhausted = false;
+        app.filters.enabled_cameras.clear();
+
+        let before = app.fetcher.issued_count();
+        app.request_more();
+
+        // Such a query can only come back empty, so it is not worth sending.
+        assert_eq!(app.fetcher.issued_count(), before);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn alt_click_reaches_the_camera_list_through_the_ui() {
+        let (app, dir) = test_app_thumbs_only(&["A"]);
+        let mut harness =
+            egui_kittest::Harness::new_ui_state(|ui, app: &mut App| app.ui_impl(ui), app);
+        settle(&mut harness);
+
+        assert!(harness.state().filters.all_cameras_enabled());
+
+        // The modifier has to survive the trip through the checkbox, which
+        // flips its own bool before the handler sees the click.
+        harness
+            .get_by_label("MCZ_LEFT")
+            .click_modifiers(egui::Modifiers::ALT);
+        settle(&mut harness);
+
+        assert_eq!(
+            harness.state().filters.enabled_cameras,
+            vec!["MCZ_LEFT".to_string()],
+            "alt-click should isolate the camera, not merely untick it"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_plain_click_only_unticks_one_camera() {
+        let (app, dir) = test_app_thumbs_only(&["A"]);
+        let mut harness =
+            egui_kittest::Harness::new_ui_state(|ui, app: &mut App| app.ui_impl(ui), app);
+        settle(&mut harness);
+
+        harness.get_by_label("MCZ_LEFT").click();
+        settle(&mut harness);
+
+        let enabled = &harness.state().filters.enabled_cameras;
+        assert_eq!(enabled.len(), MARS2020_CAMERAS.len() - 1);
+        assert!(!enabled.iter().any(|c| c == "MCZ_LEFT"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn the_camera_list_claims_the_full_width_available_to_it() {
         // The camera names are narrower than the panel, so a scroll area left
         // to shrink to its content claims only that much width and leaves its
@@ -1862,6 +2079,10 @@ mod tests {
             "Reset",
             "waiting for the first results",
             "Cameras",
+            "All",
+            "Every camera is switched off.",
+            "Alt-click to show only this camera",
+            "Alt-click to show every other camera",
             "Loading\u{2026}",
             "Loading image\u{2026}",
             "No images match these filters.",
@@ -1955,7 +2176,7 @@ mod tests {
     fn the_slider_sets_an_upper_bound_not_an_exact_day() {
         let f = Filters {
             up_to_sol: Some(1000),
-            cameras: vec!["NAVCAM_LEFT".into()],
+            enabled_cameras: vec!["NAVCAM_LEFT".into()],
         };
         let q = f.to_query();
 

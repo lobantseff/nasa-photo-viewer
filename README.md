@@ -16,7 +16,9 @@ so repeat browsing is instant and works offline.
 - Seek through the mission with a sol slider (a Martian day, 0 being
   landing) that sets the newest sol to show; results run back from there,
   newest first. The slider's value box also accepts a typed sol
-- Filter by camera
+- Filter by camera: every camera starts ticked, so the checkboxes state what
+  is on screen. Alt-click isolates one camera, and alt-clicking it again
+  inverts the selection
 - Local caching: SQLite for metadata, disk for images, ~2 GiB LRU budget
 - Decoded textures are kept in a bounded LRU, and the images either side of
   the selection are fetched ahead so arrow-key browsing does not stall
