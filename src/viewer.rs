@@ -111,6 +111,15 @@ impl ZoomPan {
         Rect::from_center_size(viewport.center() + self.offset, scaled)
     }
 
+    /// Whether any part of the image is currently off-screen.
+    ///
+    /// Drives both the grab cursor and whether drag gestures do anything: a
+    /// fully visible image has nowhere to pan to.
+    pub fn is_pannable(&self, size: Vec2, viewport: Vec2) -> bool {
+        let scaled = size * self.scale;
+        scaled.x > viewport.x + 0.5 || scaled.y > viewport.y + 0.5
+    }
+
     /// Constrain panning so the image cannot be dragged away from the view.
     ///
     /// An axis that fits entirely is centred: sliding a fully visible image
@@ -129,6 +138,45 @@ impl ZoomPan {
 
         self.offset.x = limit(scaled.x, viewport.width(), self.offset.x);
         self.offset.y = limit(scaled.y, viewport.height(), self.offset.y);
+    }
+}
+
+/// A pointer or trackpad gesture over the image.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Gesture {
+    /// Pinch, or ctrl+scroll, which egui reports uniformly as a zoom factor.
+    Zoom(f32),
+    /// Two-finger drag, or a plain wheel, which scrolls rather than zooms.
+    Pan(Vec2),
+    None,
+}
+
+/// Classify this frame's trackpad and wheel input.
+///
+/// Zoom wins over pan: egui reports a pinch as a zoom factor, and a trackpad
+/// pinch frequently carries a small incidental scroll that would otherwise
+/// make the image creep while magnifying.
+pub fn gesture_from(zoom_delta: f32, scroll: Vec2) -> Gesture {
+    const ZOOM_EPS: f32 = 1e-4;
+
+    if (zoom_delta - 1.0).abs() > ZOOM_EPS && zoom_delta > 0.0 {
+        Gesture::Zoom(zoom_delta)
+    } else if scroll != Vec2::ZERO {
+        Gesture::Pan(scroll)
+    } else {
+        Gesture::None
+    }
+}
+
+/// Cursor to show over the image.
+///
+/// Returns `None` when the image fits entirely, since there is nothing to drag
+/// and a grab cursor would promise interaction that does nothing.
+pub fn cursor_for(pannable: bool, dragging: bool) -> Option<egui::CursorIcon> {
+    match (pannable, dragging) {
+        (true, true) => Some(egui::CursorIcon::Grabbing),
+        (true, false) => Some(egui::CursorIcon::Grab),
+        (false, _) => None,
     }
 }
 
@@ -277,6 +325,53 @@ mod tests {
             rect.min.y <= vp.min.y + 0.01 && rect.max.y >= vp.max.y - 0.01,
             "vertical gap opened: {rect:?} vs {vp:?}"
         );
+    }
+
+    #[test]
+    fn pannability_tracks_whether_the_image_overflows_the_view() {
+        let vp = vec2(1000.0, 800.0);
+        let image = vec2(2000.0, 1600.0);
+        let mut zp = ZoomPan::default();
+
+        zp.fit(image, vp);
+        assert!(
+            !zp.is_pannable(image, vp),
+            "a fitted image has nowhere to go"
+        );
+
+        zp.zoom_at(2.0, Pos2::ZERO, Rect::from_min_size(Pos2::ZERO, vp));
+        assert!(zp.is_pannable(image, vp), "a zoomed image must be pannable");
+    }
+
+    #[test]
+    fn a_pinch_is_read_as_zoom_and_a_scroll_as_pan() {
+        assert_eq!(gesture_from(1.5, Vec2::ZERO), Gesture::Zoom(1.5));
+        assert_eq!(gesture_from(0.5, Vec2::ZERO), Gesture::Zoom(0.5));
+        assert_eq!(
+            gesture_from(1.0, vec2(3.0, -7.0)),
+            Gesture::Pan(vec2(3.0, -7.0))
+        );
+        assert_eq!(gesture_from(1.0, Vec2::ZERO), Gesture::None);
+    }
+
+    #[test]
+    fn a_pinch_carrying_incidental_scroll_still_zooms() {
+        // Trackpad pinches often report a little scroll alongside the zoom;
+        // panning at the same time would make the image creep.
+        assert_eq!(gesture_from(1.2, vec2(2.0, 2.0)), Gesture::Zoom(1.2));
+    }
+
+    #[test]
+    fn a_degenerate_zoom_factor_is_ignored() {
+        assert_eq!(gesture_from(0.0, Vec2::ZERO), Gesture::None);
+    }
+
+    #[test]
+    fn the_grab_cursor_only_appears_when_there_is_something_to_drag() {
+        assert_eq!(cursor_for(true, false), Some(egui::CursorIcon::Grab));
+        assert_eq!(cursor_for(true, true), Some(egui::CursorIcon::Grabbing));
+        assert_eq!(cursor_for(false, false), None);
+        assert_eq!(cursor_for(false, true), None);
     }
 
     #[test]

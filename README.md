@@ -23,7 +23,17 @@ so repeat browsing is instant and works offline.
 cargo run --release
 ```
 
-Keyboard: `←`/`→` step between images, `Esc` returns to the gallery.
+Controls in the detail view:
+
+| Input | Action |
+| --- | --- |
+| Trackpad pinch, or `Ctrl`+scroll | Zoom about the pointer |
+| Two-finger scroll, or drag | Pan a zoomed image |
+| `←` / `→` | Previous / next image |
+| `Esc` | Back to the gallery |
+
+Zoom stops once the whole image is visible; an image smaller than the
+window stops at 1:1 rather than being upscaled to fill it.
 
 The cache lives in the platform cache directory (on macOS,
 `~/Library/Caches/dev.npv.nasa-photo-viewer`). Deleting it is safe.

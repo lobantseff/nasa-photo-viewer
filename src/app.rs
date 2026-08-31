@@ -8,7 +8,7 @@ use crate::cache::Cache;
 use crate::fetch::{Fetcher, ImageKind, Update};
 use crate::model::{Image, ImageSize};
 use crate::query::{MARS2020_CAMERAS, MAX_PAGE_SIZE, Order, Query};
-use crate::viewer::ZoomPan;
+use crate::viewer::{Gesture, ZoomPan, cursor_for, gesture_from};
 
 const THUMB_SIZE: f32 = 150.0;
 
@@ -539,18 +539,32 @@ impl App {
             self.zoom.set_bounds(img_size, viewport.size());
         }
 
+        let pannable = self.zoom.is_pannable(img_size, viewport.size());
+
         if response.dragged() {
             self.zoom.pan(response.drag_delta());
         }
 
         if response.hovered() {
-            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-            if scroll.abs() > 0.0
-                && let Some(pointer) = ui.input(|i| i.pointer.hover_pos())
-            {
-                self.zoom.zoom_at((scroll * 0.004).exp(), pointer, viewport);
+            let (zoom_delta, scroll, pointer) =
+                ui.input(|i| (i.zoom_delta(), i.smooth_scroll_delta, i.pointer.hover_pos()));
+
+            match gesture_from(zoom_delta, scroll) {
+                Gesture::Zoom(factor) => {
+                    let anchor = pointer.unwrap_or(viewport.center());
+                    self.zoom.zoom_at(factor, anchor, viewport);
+                }
+                Gesture::Pan(delta) => self.zoom.pan(delta),
+                Gesture::None => {}
             }
         }
+
+        if (response.hovered() || response.dragged())
+            && let Some(icon) = cursor_for(pannable, response.dragged())
+        {
+            ui.ctx().set_cursor_icon(icon);
+        }
+
         self.zoom.clamp_to(img_size, viewport);
 
         let rect = self.zoom.image_rect(img_size, viewport);
@@ -721,9 +735,13 @@ mod tests {
                 format!("https://x/{id}_320.jpg"),
                 format!("https://x/{id}_1200.jpg"),
             ] {
+                // Large enough that zooming in genuinely overflows the
+                // viewport, which is what makes panning possible.
+                const N: usize = 64;
+                let pixels = vec![200u8; N * N * 4];
                 let tex = ctx.load_texture(
                     url.clone(),
-                    egui::ColorImage::from_rgba_unmultiplied([1, 1], &[255, 0, 0, 255]),
+                    egui::ColorImage::from_rgba_unmultiplied([N, N], &pixels),
                     egui::TextureOptions::LINEAR,
                 );
                 app.textures.insert(url, tex);
@@ -790,6 +808,99 @@ mod tests {
             offending.is_empty(),
             "image mesh was allowed to paint over the toolbar at {toolbar:?}"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Hover over the middle of the image area, below the toolbar.
+    fn hover_image_area(harness: &mut egui_kittest::Harness<'_, App>) -> egui::Pos2 {
+        let toolbar = harness.get_by_label("Fit").rect();
+        let pos = egui::pos2(toolbar.center().x + 200.0, toolbar.max.y + 250.0);
+        harness.hover_at(pos);
+        harness.run();
+        pos
+    }
+
+    #[test]
+    fn a_pinch_gesture_zooms_the_image() {
+        let (app, dir) = test_app(&["ALPHA"]);
+        let mut harness =
+            egui_kittest::Harness::new_ui_state(|ui, app: &mut App| app.ui_impl(ui), app);
+        harness.run();
+        harness.get_by_label("ALPHA").click();
+        harness.run();
+
+        hover_image_area(&mut harness);
+        let before = harness.state().zoom.scale;
+
+        // egui reports a trackpad pinch as a Zoom event.
+        harness.event(egui::Event::Zoom(2.0));
+        harness.run();
+
+        assert!(
+            harness.state().zoom.scale > before,
+            "pinch should magnify: {before} -> {}",
+            harness.state().zoom.scale
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_two_finger_scroll_pans_a_zoomed_image() {
+        let (app, dir) = test_app(&["ALPHA"]);
+        let mut harness =
+            egui_kittest::Harness::new_ui_state(|ui, app: &mut App| app.ui_impl(ui), app);
+        harness.run();
+        harness.get_by_label("ALPHA").click();
+        harness.run();
+
+        hover_image_area(&mut harness);
+
+        // Zoom in first, otherwise the image fits and panning is pinned.
+        harness.state_mut().zoom.needs_fit = false;
+        harness.state_mut().zoom.scale = 20.0;
+        harness.run();
+        let before = harness.state().zoom.offset;
+
+        harness.event(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, -60.0),
+            modifiers: egui::Modifiers::NONE,
+            phase: egui::TouchPhase::Move,
+        });
+        harness.run();
+
+        assert_ne!(
+            harness.state().zoom.offset,
+            before,
+            "a two-finger scroll should pan a zoomed image"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn scrolling_does_not_move_an_image_that_already_fits() {
+        let (app, dir) = test_app(&["ALPHA"]);
+        let mut harness =
+            egui_kittest::Harness::new_ui_state(|ui, app: &mut App| app.ui_impl(ui), app);
+        harness.run();
+        harness.get_by_label("ALPHA").click();
+        harness.run();
+
+        hover_image_area(&mut harness);
+
+        harness.event(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, -60.0),
+            modifiers: egui::Modifiers::NONE,
+            phase: egui::TouchPhase::Move,
+        });
+        harness.run();
+
+        // The test image fits, so it stays pinned to the centre.
+        assert_eq!(harness.state().zoom.offset, egui::Vec2::ZERO);
 
         std::fs::remove_dir_all(&dir).ok();
     }
