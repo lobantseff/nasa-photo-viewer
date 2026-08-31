@@ -20,6 +20,8 @@ so repeat browsing is instant and works offline.
 - While a detail rendition loads, the gallery thumbnail stands in for it, so
   stepping between images never lands on an empty panel
 - Works offline against anything previously browsed
+- Cached results are shown immediately and refreshed in the background, so
+  changing filters never waits on a slow upstream response
 - Remembers window size and last filters
 
 ## Running

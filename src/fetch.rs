@@ -53,6 +53,14 @@ pub enum Update {
     Connectivity { online: bool },
 }
 
+/// A listing served from the local cache.
+pub struct CachedListing {
+    pub images: Vec<Image>,
+    pub total_results: Option<u64>,
+    /// Past its refresh window, so a background refresh is warranted.
+    pub stale: bool,
+}
+
 pub struct Fetcher {
     rt: Runtime,
     client: Arc<Client>,
@@ -114,13 +122,20 @@ impl Fetcher {
         self.issued
     }
 
-    /// Read a listing page straight from cache, if it is still fresh.
+    /// Read a listing page from cache, however old, reporting whether it is
+    /// past its refresh window.
     ///
-    /// Lets the UI paint instantly on launch instead of waiting a round trip.
-    pub fn cached_listing(&self, query: &Query, page: u64) -> Option<(Vec<Image>, Option<u64>)> {
+    /// Stale records are still perfectly good photographs. Withholding them
+    /// buys nothing and costs a blank screen for as long as the upstream
+    /// request takes, which for a cold query is many seconds.
+    pub fn cached_listing(&self, query: &Query, page: u64) -> Option<CachedListing> {
         let cache = self.cache.lock().ok()?;
-        let listing = cache.listing(query, page, false).ok().flatten()?;
-        Some((listing.images, listing.total_results))
+        let listing = cache.listing(query, page, true).ok().flatten()?;
+        Some(CachedListing {
+            images: listing.images,
+            total_results: listing.total_results,
+            stale: listing.stale,
+        })
     }
 
     /// Request a listing page unless an identical request is already running.

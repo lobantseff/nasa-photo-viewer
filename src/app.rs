@@ -145,13 +145,26 @@ impl App {
         })
     }
 
-    /// Paint instantly from cache when the first page is already stored.
+    /// Paint instantly from cache, refreshing behind the UI if it is stale.
+    ///
+    /// Upstream is slow enough on a cold query that waiting for it leaves the
+    /// window empty for many seconds, so anything already stored is shown
+    /// first and corrected once the response lands.
     fn prime_from_cache(&mut self) {
         let query = self.filters.to_query();
-        if let Some((images, total)) = self.fetcher.cached_listing(&query, 0) {
-            self.absorb(images);
-            self.total_results = total;
-            self.next_page = 1;
+        let Some(cached) = self.fetcher.cached_listing(&query, 0) else {
+            return;
+        };
+
+        self.serving_stale = cached.stale;
+        self.total_results = cached.total_results;
+        self.absorb(cached.images);
+        self.next_page = 1;
+
+        if cached.stale {
+            // Page 0 is what the user is looking at, so refresh that rather
+            // than only paging onwards.
+            self.fetcher.request_listing(&query, 0);
         }
     }
 
@@ -167,7 +180,8 @@ impl App {
         self.active_key = self.filters.to_query().cache_key();
         self.images.clear();
         self.seen.clear();
-        self.textures.clear();
+        // Textures are keyed by URL and bounded by their own budget, so
+        // keeping them lets an overlapping filter redraw instantly.
         self.selected = None;
         self.total_results = None;
         self.next_page = 0;
@@ -200,17 +214,7 @@ impl App {
                     if query_key != self.active_key {
                         continue;
                     }
-                    self.serving_stale = from_stale_cache;
-                    self.total_results = total_results.or(self.total_results);
-
-                    if images.is_empty() {
-                        self.exhausted = true;
-                    } else {
-                        if page >= self.next_page {
-                            self.next_page = page + 1;
-                        }
-                        self.absorb(images);
-                    }
+                    self.merge_listing(page, from_stale_cache, images, total_results);
                 }
                 Update::Image { url, image, kind } => {
                     if kind == ImageKind::Full {
@@ -227,6 +231,34 @@ impl App {
                 Update::Connectivity { .. } => {}
             }
         }
+    }
+
+    /// Fold a listing page into the displayed set.
+    fn merge_listing(
+        &mut self,
+        page: u64,
+        from_stale_cache: bool,
+        images: Vec<Image>,
+        total_results: Option<u64>,
+    ) {
+        // A freshly fetched first page supersedes whatever was shown from
+        // cache; appending would interleave the two orderings instead of
+        // replacing, stranding the stale items at the top.
+        if page == 0 && !from_stale_cache && self.serving_stale {
+            self.images.clear();
+            self.seen.clear();
+        }
+        self.serving_stale = from_stale_cache;
+        self.total_results = total_results.or(self.total_results);
+
+        if images.is_empty() {
+            self.exhausted = true;
+            return;
+        }
+        if page >= self.next_page {
+            self.next_page = page + 1;
+        }
+        self.absorb(images);
     }
 
     fn sidebar(&mut self, ui: &mut egui::Ui) {
@@ -328,7 +360,12 @@ impl App {
                 }
 
                 if self.serving_stale {
-                    ui.label("· showing cached results");
+                    let refreshing = self.fetcher.inflight_count() > 0;
+                    ui.label(if refreshing {
+                        "· cached results, refreshing"
+                    } else {
+                        "· cached results"
+                    });
                 }
                 if self.fetcher.inflight_count() > 0 {
                     ui.spinner();
@@ -351,7 +388,17 @@ impl App {
         if self.images.is_empty() {
             ui.centered_and_justified(|ui| {
                 if self.fetcher.inflight_count() > 0 {
-                    ui.label("Loading images…");
+                    ui.vertical_centered(|ui| {
+                        ui.spinner();
+                        ui.label("Loading images…");
+                        ui.label(
+                            RichText::new(
+                                "NASA's first response for a new filter can take a while",
+                            )
+                            .weak()
+                            .small(),
+                        );
+                    });
                 } else {
                     ui.label("No images match these filters.");
                 }
@@ -813,6 +860,28 @@ mod tests {
     use crate::viewer::MAX_SCALE;
     use egui_kittest::kittest::Queryable as _;
 
+    fn temp_cache_dir() -> std::path::PathBuf {
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "npv-stale-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn test_image(id: &str) -> Image {
+        serde_json::from_value(serde_json::json!({
+            "imageid": id,
+            "sol": 1000,
+            "camera": { "instrument": "NAVCAM_LEFT" },
+            "image_files": { "small": thumb_url(id), "large": large_url(id) },
+        }))
+        .unwrap()
+    }
+
     fn thumb_url(id: &str) -> String {
         format!("https://x/{id}_320.jpg")
     }
@@ -1094,6 +1163,99 @@ mod tests {
             app.textures.insert(thumb_url(id), tex, Tier::Thumbnail);
         }
         (app, dir)
+    }
+
+    /// Age every cached listing past its refresh window.
+    fn expire_cached_listings(dir: &std::path::Path) {
+        let db = rusqlite::Connection::open(dir.join("metadata.sqlite")).unwrap();
+        db.execute(
+            "UPDATE listings SET fetched_at = fetched_at - ?1",
+            [crate::cache::LISTING_TTL_SECS * 10],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn expired_cached_results_are_shown_instead_of_a_blank_screen() {
+        // Populate the cache, then age it past its refresh window.
+        let dir = temp_cache_dir();
+        let query = Filters::default().to_query();
+        let images: Vec<Image> = ["OLD1", "OLD2"].iter().map(|id| test_image(id)).collect();
+        {
+            let mut cache = Cache::open_at(&dir, DEFAULT_CACHE_BUDGET).unwrap();
+            cache.put_listing(&query, 0, Some(2), &images).unwrap();
+        }
+        expire_cached_listings(&dir);
+
+        let cache = Cache::open_at(&dir, DEFAULT_CACHE_BUDGET).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = App::build(ctx, cache, Filters::default()).unwrap();
+        app.prime_from_cache();
+
+        // Upstream can take many seconds; the user should not stare at an
+        // empty window in the meantime.
+        assert_eq!(app.images.len(), 2, "stale results should be shown at once");
+        assert!(app.serving_stale, "and be flagged as cached");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_fresh_first_page_replaces_the_stale_one_rather_than_appending() {
+        let dir = temp_cache_dir();
+        let cache = Cache::open_at(&dir, DEFAULT_CACHE_BUDGET).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = App::build(ctx, cache, Filters::default()).unwrap();
+
+        app.serving_stale = true;
+        app.absorb(vec![test_image("OLD1"), test_image("OLD2")]);
+
+        app.merge_listing(
+            0,
+            false,
+            vec![test_image("NEW1"), test_image("NEW2")],
+            Some(2),
+        );
+
+        // Appending would interleave two orderings and leave the stale items
+        // stranded at the top.
+        let ids: Vec<String> = app.images.iter().map(|i| i.id().to_string()).collect();
+        assert_eq!(ids, vec!["NEW1", "NEW2"]);
+        assert!(!app.serving_stale);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_later_fresh_page_appends_rather_than_replacing() {
+        let dir = temp_cache_dir();
+        let cache = Cache::open_at(&dir, DEFAULT_CACHE_BUDGET).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = App::build(ctx, cache, Filters::default()).unwrap();
+
+        app.serving_stale = true;
+        app.absorb(vec![test_image("A")]);
+        app.merge_listing(1, false, vec![test_image("B")], Some(2));
+
+        assert_eq!(app.images.len(), 2, "page 1 must extend, not replace");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn changing_filters_keeps_decoded_thumbnails() {
+        let (mut app, dir) = test_app_thumbs_only(&["A", "B"]);
+        let before = app.textures.count(Tier::Thumbnail);
+        assert!(before > 0);
+
+        app.filters.sol = "1000".into();
+        app.reset_for_new_filters();
+
+        // Filters usually overlap, so discarding decoded thumbnails would
+        // force them all to be fetched and decoded again.
+        assert_eq!(app.textures.count(Tier::Thumbnail), before);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
