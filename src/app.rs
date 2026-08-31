@@ -35,6 +35,13 @@ const LATEST_SOL_KEY: &str = "npv_latest_sol";
 ///
 /// egui's default fonts have no arrow glyphs (U+2190 and the emoji arrows all
 /// render as tofu), so this uses a guillemet, which they do provide.
+/// Progress of the full-resolution original for the open image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FullResStatus {
+    Loading,
+    Loaded,
+}
+
 /// What the detail view managed to draw this frame.
 ///
 /// Painted text is invisible to the accessibility tree, so this is what lets
@@ -261,6 +268,24 @@ impl App {
         }
     }
 
+    /// Where the full-resolution original has got to for the open image.
+    ///
+    /// Only images that genuinely publish one qualify: `url_for` falls back to
+    /// smaller renditions, so asking it would claim full resolution for an
+    /// image that has none.
+    fn full_res_status(&self) -> Option<FullResStatus> {
+        let image = self.images.get(self.selected?)?;
+        let url = image.image_files.full_res.as_deref()?;
+
+        if self.textures.contains(url) {
+            Some(FullResStatus::Loaded)
+        } else if self.full_res_pending {
+            Some(FullResStatus::Loading)
+        } else {
+            None
+        }
+    }
+
     /// Fold a listing page into the displayed set.
     fn merge_listing(
         &mut self,
@@ -428,12 +453,30 @@ impl App {
                     ui.label(format!("{images} image(s) loading"));
                 }
 
-                if let Some(err) = self.error.clone() {
+                let full_res = self.full_res_status();
+                let error = self.error.clone();
+                if full_res.is_some() || error.is_some() {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("dismiss").clicked() {
-                            self.error = None;
+                        // Added first, so it sits hard against the right edge
+                        // and keeps a fixed home regardless of what else the
+                        // status bar is saying.
+                        match full_res {
+                            Some(FullResStatus::Loaded) => {
+                                ui.label(RichText::new("full resolution").italics());
+                            }
+                            Some(FullResStatus::Loading) => {
+                                ui.label(RichText::new("loading full resolution").italics());
+                                ui.spinner();
+                            }
+                            None => {}
                         }
-                        ui.colored_label(Color32::LIGHT_RED, truncate(&err, 90));
+
+                        if let Some(err) = error {
+                            if ui.small_button("dismiss").clicked() {
+                                self.error = None;
+                            }
+                            ui.colored_label(Color32::LIGHT_RED, truncate(&err, 90));
+                        }
                     });
                 }
             });
@@ -672,15 +715,8 @@ impl App {
             ui.separator();
             let full_url = image.url_for(ImageSize::FullRes).map(|s| s.to_string());
             if let Some(full) = full_url.clone() {
-                // Full resolution now arrives on its own once zoomed in; this
-                // only reports where that has got to.
-                if self.textures.contains(&full) {
-                    ui.label(RichText::new("full resolution").italics());
-                } else if self.full_res_pending {
-                    ui.spinner();
-                    ui.label(RichText::new("loading full resolution").italics());
-                }
-
+                // Progress is reported in the status bar: a label appearing
+                // here would shift the buttons beside it.
                 if ui.button("Save…").clicked() {
                     let name = format!("{}.png", image.id());
                     if let Some(path) = rfd::FileDialog::new().set_file_name(name).save_file()
@@ -1369,6 +1405,72 @@ mod tests {
     }
 
     #[test]
+    fn full_resolution_progress_is_reported_only_for_the_open_image() {
+        let (mut app, dir) = test_app_thumbs_only(&["A"]);
+
+        // Nothing open.
+        assert_eq!(app.full_res_status(), None);
+
+        app.selected = Some(0);
+        assert_eq!(app.full_res_status(), None, "idle, so nothing to report");
+
+        app.full_res_pending = true;
+        assert_eq!(app.full_res_status(), Some(FullResStatus::Loading));
+
+        let ctx = egui::Context::default();
+        let tex = ctx.load_texture(
+            "f",
+            egui::ColorImage::from_rgba_unmultiplied([1, 1], &[1, 2, 3, 255]),
+            egui::TextureOptions::LINEAR,
+        );
+        app.textures.insert(full_res_url("A"), tex, Tier::Detail);
+        assert_eq!(app.full_res_status(), Some(FullResStatus::Loaded));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_image_without_an_original_never_claims_full_resolution() {
+        let dir = temp_cache_dir();
+        let cache = Cache::open_at(&dir, DEFAULT_CACHE_BUDGET).unwrap();
+        let mut app = offline_app(egui::Context::default(), cache);
+
+        // `url_for` falls back to smaller renditions, so asking it would
+        // report full resolution for an image that publishes none.
+        app.absorb(vec![test_image("A")]);
+        app.selected = Some(0);
+        app.full_res_pending = true;
+
+        assert_eq!(app.full_res_status(), None);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_detail_toolbar_keeps_a_fixed_set_of_controls() {
+        let (mut app, dir) = test_app_thumbs_only(&["A"]);
+        app.selected = Some(0);
+
+        let mut harness =
+            egui_kittest::Harness::new_ui_state(|ui, app: &mut App| app.ui_impl(ui), app);
+        settle(&mut harness);
+
+        // The progress text lives in the status bar now; in the toolbar it
+        // would appear and vanish, shifting the buttons beside it.
+        harness.state_mut().full_res_pending = true;
+        settle(&mut harness);
+
+        for label in ["Fit", "+", "Save…"] {
+            assert!(
+                harness.query_by_label(label).is_some(),
+                "{label} should still be present"
+            );
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn arrowing_off_the_end_asks_for_the_next_page() {
         let (mut app, dir) = test_app_thumbs_only(&["A", "B", "C"]);
         app.exhausted = false;
@@ -1696,9 +1798,10 @@ mod tests {
             "Fit",
             "\u{2212}",
             "+",
-            "Load full resolution",
             "Save\u{2026}",
             "full resolution",
+            "loading full resolution",
+            "fetching more results…",
             "Gallery",
             "Clear",
             "reset",
