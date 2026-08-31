@@ -13,9 +13,10 @@ so repeat browsing is instant and works offline.
 - Zoom (cursor-anchored) and drag-to-pan detail view
 - 1200px preview loads immediately; the full-resolution PNG is fetched
   automatically once you zoom past it
-- Filter by sol (a Martian day, 0 being landing) with a slider whose value
-  box also accepts a typed sol, and by camera; sort newest/oldest/by capture
-  date
+- Seek through the mission with a sol slider (a Martian day, 0 being
+  landing) that sets the newest sol to show; results run back from there,
+  newest first. The slider's value box also accepts a typed sol
+- Filter by camera
 - Local caching: SQLite for metadata, disk for images, ~2 GiB LRU budget
 - Decoded textures are kept in a bounded LRU, and the images either side of
   the selection are fetched ahead so arrow-key browsing does not stall
@@ -88,7 +89,7 @@ subframe, spacecraft clock, mast azimuth/elevation).
 | `order` | `sol desc`, `sol asc`, `date_taken desc`. |
 | `search` | Camera instrument names, OR-ed with `\|`. |
 | `condition_1` | Mission scope: `mars2020:mission`. |
-| `condition_2`, `condition_3`, … | Range filters: `100:sol:gte`, `2026-08-01:date_taken:lte`. |
+| `condition_2`, `condition_3`, … | Range filters: `100:sol:gte`, `1000:sol:lte`. |
 | `id` | Single-image lookup. |
 
 Camera names accepted by `search`: `NAVCAM_LEFT`, `NAVCAM_RIGHT`,
@@ -104,6 +105,10 @@ These are the behaviours this client exists to absorb:
 - **`condition_1` is not a range slot.** A range placed there is silently
   ignored and the response comes back unfiltered with HTTP 200. Range filters
   must start at `condition_2`.
+- **Condition slots are positional by operator.** A lower bound must sit in a
+  lower-numbered slot than the upper bound it pairs with: `condition_2=…:lte`
+  alone is ignored, while the same filter in `condition_3` works. Getting this
+  wrong returns unfiltered results with HTTP 200, not an error.
 - **Multiple cameras join with `|`, not `,`.** A comma-separated list is
   accepted but matches zero images.
 - **`num` is capped at 100.** Larger values are accepted and silently reduced,

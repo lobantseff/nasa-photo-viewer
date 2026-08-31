@@ -148,23 +148,25 @@ impl Query {
         // Slot 1 scopes the query to the mission; ranges start at slot 2.
         params.push(("condition_1".to_string(), format!("{CATEGORY}:mission")));
 
-        let mut slot = 2;
-        let mut push_condition = |params: &mut Vec<(String, String)>, value: String| {
+        // Slots are positional by operator, not by order of use: a lower
+        // bound must occupy a lower-numbered slot than the upper bound it
+        // pairs with. An `lte` placed before its `gte` is silently ignored and
+        // the response comes back unfiltered with HTTP 200.
+        let condition = |params: &mut Vec<(String, String)>, slot: u8, value: String| {
             params.push((format!("condition_{slot}"), value));
-            slot += 1;
         };
 
         if let Some(min) = self.min_sol {
-            push_condition(&mut params, format!("{min}:sol:gte"));
+            condition(&mut params, 2, format!("{min}:sol:gte"));
         }
         if let Some(max) = self.max_sol {
-            push_condition(&mut params, format!("{max}:sol:lte"));
+            condition(&mut params, 3, format!("{max}:sol:lte"));
         }
         if let Some(after) = &self.taken_after {
-            push_condition(&mut params, format!("{after}:date_taken:gte"));
+            condition(&mut params, 4, format!("{after}:date_taken:gte"));
         }
         if let Some(before) = &self.taken_before {
-            push_condition(&mut params, format!("{before}:date_taken:lte"));
+            condition(&mut params, 5, format!("{before}:date_taken:lte"));
         }
 
         params
@@ -246,19 +248,21 @@ mod tests {
     }
 
     #[test]
-    fn allocates_condition_slots_without_gaps() {
-        // Only an upper bound: it must land in slot 2, not slot 3.
+    fn an_upper_bound_alone_still_occupies_the_upper_slot() {
+        // Verified against the service: an `lte` in slot 2 is ignored and the
+        // response comes back unfiltered, so it stays in slot 3 even when no
+        // lower bound precedes it.
         let q = Query {
             max_sol: Some(50),
             ..Query::default()
         };
         let params = q.to_params();
 
+        assert_eq!(lookup(&params, "condition_2"), None);
         assert_eq!(
-            lookup(&params, "condition_2").as_deref(),
+            lookup(&params, "condition_3").as_deref(),
             Some("50:sol:lte")
         );
-        assert_eq!(lookup(&params, "condition_3"), None);
     }
 
     #[test]
@@ -276,11 +280,11 @@ mod tests {
             Some("10:sol:gte")
         );
         assert_eq!(
-            lookup(&params, "condition_3").as_deref(),
+            lookup(&params, "condition_4").as_deref(),
             Some("2026-08-01:date_taken:gte")
         );
         assert_eq!(
-            lookup(&params, "condition_4").as_deref(),
+            lookup(&params, "condition_5").as_deref(),
             Some("2026-08-05:date_taken:lte")
         );
     }

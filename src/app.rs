@@ -67,7 +67,7 @@ const PREFETCH_RADIUS: usize = 3;
 const SIDEBAR_WIDTH: f32 = 230.0;
 
 /// Width of the sol slider's track, narrowed from egui's default so the
-/// "All sols" button shares its row within the sidebar.
+/// "Reset" button shares its row within the sidebar.
 const SOL_SLIDER_WIDTH: f32 = 76.0;
 
 /// Lines a page-scroll stands for, on the rare device that reports pages.
@@ -75,34 +75,28 @@ const PAGE_LINES: f32 = 10.0;
 
 const BACK_LABEL: &str = "\u{2039} Gallery";
 
-#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Filters {
-    /// A single Martian day to show, or `None` for every sol.
-    pub sol: Option<i64>,
+    /// Newest sol to show, or `None` to start from the latest.
+    ///
+    /// An upper bound rather than an exact day: results run newest-first from
+    /// here backwards, so the chosen sol is at the top and browsing continues
+    /// into earlier ones instead of stopping at a day boundary.
+    pub up_to_sol: Option<i64>,
     pub cameras: Vec<String>,
-    pub order: Order,
-}
-
-impl Default for Filters {
-    fn default() -> Self {
-        Self {
-            sol: None,
-            cameras: Vec::new(),
-            order: Order::SolDesc,
-        }
-    }
 }
 
 impl Filters {
     pub fn to_query(&self) -> Query {
-        let sol = self.sol;
         Query {
             num: MAX_PAGE_SIZE,
             page: 0,
-            order: self.order,
+            // Always newest-first: the slider sets where "newest" starts, so a
+            // second ordering control would only contradict it.
+            order: Order::SolDesc,
             cameras: self.cameras.clone(),
-            min_sol: sol,
-            max_sol: sol,
+            min_sol: None,
+            max_sol: self.up_to_sol,
             taken_after: None,
             taken_before: None,
         }
@@ -333,7 +327,7 @@ impl App {
                 let before = self.filters.clone();
 
                 ui.horizontal(|ui| {
-                    ui.label("Sol");
+                    ui.label("Up to sol");
                     ui.label(RichText::new("(Martian day; 0 is landing)").weak().small());
                 });
 
@@ -344,24 +338,25 @@ impl App {
                             // pushing it onto a row of its own.
                             ui.spacing_mut().slider_width = SOL_SLIDER_WIDTH;
 
-                            // The slider's value box accepts typing, so the
+                            // The slider's value box accepts typing, so an
                             // exact sol is still reachable without dragging.
-                            let mut value = self.filters.sol.unwrap_or(latest).clamp(0, latest);
+                            let mut value =
+                                self.filters.up_to_sol.unwrap_or(latest).clamp(0, latest);
                             let changed = ui
                                 .add(egui::Slider::new(&mut value, 0..=latest).step_by(1.0))
                                 .changed();
                             if changed {
-                                self.filters.sol = Some(value);
+                                self.filters.up_to_sol = Some(value);
                             }
 
                             // Always drawn, so the row does not reflow when a
                             // sol is picked or cleared.
-                            let filtered = self.filters.sol.is_some();
+                            let filtered = self.filters.up_to_sol.is_some();
                             if ui
-                                .add_enabled(filtered, egui::Button::new("All sols"))
+                                .add_enabled(filtered, egui::Button::new("Reset"))
                                 .clicked()
                             {
-                                self.filters.sol = None;
+                                self.filters.up_to_sol = None;
                             }
                         });
                     }
@@ -373,28 +368,6 @@ impl App {
                         );
                     }
                 }
-
-                ui.add_space(10.0);
-                ui.label("Order");
-                egui::ComboBox::from_id_salt("order")
-                    .selected_text(match self.filters.order {
-                        Order::SolDesc => "Newest first",
-                        Order::SolAsc => "Oldest first",
-                        Order::DateTakenDesc => "Date taken",
-                    })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut self.filters.order,
-                            Order::SolDesc,
-                            "Newest first",
-                        );
-                        ui.selectable_value(&mut self.filters.order, Order::SolAsc, "Oldest first");
-                        ui.selectable_value(
-                            &mut self.filters.order,
-                            Order::DateTakenDesc,
-                            "Date taken",
-                        );
-                    });
 
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
@@ -1407,7 +1380,7 @@ mod tests {
         let before = app.textures.count(Tier::Thumbnail);
         assert!(before > 0);
 
-        app.filters.sol = Some(1000);
+        app.filters.up_to_sol = Some(1000);
         app.reset_for_new_filters();
 
         // Filters usually overlap, so discarding decoded thumbnails would
@@ -1421,13 +1394,13 @@ mod tests {
     fn the_sol_control_and_its_button_share_one_row_inside_the_sidebar() {
         let (mut app, dir) = test_app_thumbs_only(&["A"]);
         app.latest_sol = Some(1965);
-        app.filters.sol = Some(1000);
+        app.filters.up_to_sol = Some(1000);
 
         let mut harness =
             egui_kittest::Harness::new_ui_state(|ui, app: &mut App| app.ui_impl(ui), app);
         settle(&mut harness);
 
-        let button = harness.get_by_label("All sols").rect();
+        let button = harness.get_by_label("Reset").rect();
 
         // On its own row the button would start at the sidebar's left margin.
         assert!(
@@ -1850,15 +1823,11 @@ mod tests {
             "online",
             "offline",
             "Perseverance",
-            "Sol",
+            "Up to sol",
             "(Martian day; 0 is landing)",
-            "All sols",
+            "Reset",
             "waiting for the first results",
-            "Order",
             "Cameras",
-            "Newest first",
-            "Oldest first",
-            "Date taken",
             "Loading\u{2026}",
             "Loading image\u{2026}",
             "No images match these filters.",
@@ -1949,26 +1918,28 @@ mod tests {
     }
 
     #[test]
-    fn filters_map_a_sol_to_both_bounds() {
+    fn the_slider_sets_an_upper_bound_not_an_exact_day() {
         let f = Filters {
-            sol: Some(1000),
+            up_to_sol: Some(1000),
             cameras: vec!["NAVCAM_LEFT".into()],
-            order: Order::SolDesc,
         };
         let q = f.to_query();
 
-        // A single Martian day is a range of one.
-        assert_eq!(q.min_sol, Some(1000));
+        // An upper bound only: results run back from sol 1000, so browsing
+        // carries on into earlier sols instead of stopping at that day.
         assert_eq!(q.max_sol, Some(1000));
+        assert_eq!(q.min_sol, None);
+        assert_eq!(q.order, Order::SolDesc);
         assert_eq!(q.cameras, vec!["NAVCAM_LEFT".to_string()]);
     }
 
     #[test]
-    fn no_sol_selected_means_every_sol() {
+    fn no_sol_selected_starts_from_the_latest() {
         let q = Filters::default().to_query();
 
         assert_eq!(q.min_sol, None);
         assert_eq!(q.max_sol, None);
+        assert_eq!(q.order, Order::SolDesc);
     }
 
     #[test]
@@ -1991,7 +1962,7 @@ mod tests {
     fn changing_filters_changes_the_cache_key() {
         let a = Filters::default();
         let b = Filters {
-            sol: Some(1000),
+            up_to_sol: Some(1000),
             ..Filters::default()
         };
         assert_ne!(a.to_query().cache_key(), b.to_query().cache_key());
