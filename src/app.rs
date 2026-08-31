@@ -11,7 +11,6 @@ use crate::query::{MARS2020_CAMERAS, MAX_PAGE_SIZE, Order, Query};
 use crate::viewer::ZoomPan;
 
 const THUMB_SIZE: f32 = 150.0;
-const THUMB_PAD: f32 = 8.0;
 
 /// Rows of thumbnails to load beyond the visible range. Fetching ahead of the
 /// scroll position is what keeps the grid from stalling while scrolling.
@@ -317,9 +316,12 @@ impl App {
             return;
         }
 
-        let width = ui.available_width();
-        let cell = THUMB_SIZE + THUMB_PAD;
-        let columns = ((width / cell).floor() as usize).max(1);
+        let spacing = ui.spacing().item_spacing.x;
+        // Reserve the scrollbar, otherwise the rightmost thumbnail wraps onto
+        // a row of its own and the grid looks ragged.
+        let scrollbar = ui.spacing().scroll.bar_width + ui.spacing().scroll.bar_inner_margin;
+        let columns = columns_for(ui.available_width() - scrollbar, THUMB_SIZE, spacing);
+        let cell = THUMB_SIZE + ui.spacing().item_spacing.y;
         let rows = self.images.len().div_ceil(columns);
 
         let mut clicked = None;
@@ -618,6 +620,17 @@ impl App {
     }
 }
 
+/// How many thumbnails fit across `width`.
+///
+/// `n` thumbnails occupy `n * thumb + (n - 1) * spacing`, so the spacing has to
+/// be added back before dividing or the last column is dropped.
+fn columns_for(width: f32, thumb: f32, spacing: f32) -> usize {
+    if !width.is_finite() || width <= 0.0 || thumb <= 0.0 {
+        return 1;
+    }
+    (((width + spacing) / (thumb + spacing)).floor() as usize).max(1)
+}
+
 /// Index into the flat image list for a grid cell, if it exists.
 fn index_at(row: usize, col: usize, columns: usize, len: usize) -> Option<usize> {
     let idx = row * columns + col;
@@ -809,6 +822,23 @@ mod tests {
         assert_eq!(index_at(0, 0, 4, 10), Some(0));
         assert_eq!(index_at(1, 2, 4, 10), Some(6));
         assert_eq!(index_at(2, 3, 4, 10), None);
+    }
+
+    #[test]
+    fn column_count_accounts_for_inter_item_spacing() {
+        // Exactly four 150px thumbnails plus three 10px gaps = 630px.
+        assert_eq!(columns_for(630.0, 150.0, 10.0), 4);
+        // One pixel short still fits four, because the trailing gap is unused.
+        assert_eq!(columns_for(629.0, 150.0, 10.0), 3);
+        // A whole extra cell needs both the thumbnail and its leading gap.
+        assert_eq!(columns_for(790.0, 150.0, 10.0), 5);
+    }
+
+    #[test]
+    fn column_count_never_drops_below_one() {
+        for width in [-100.0, 0.0, 10.0, f32::NAN, f32::INFINITY] {
+            assert!(columns_for(width, 150.0, 10.0) >= 1, "width {width}");
+        }
     }
 
     #[test]
