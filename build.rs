@@ -11,7 +11,10 @@ use std::process::Command;
 const UNKNOWN: &str = "v0.0.0+unknown";
 
 /// Length of the abbreviated commit hash in a development version.
-const HASH_LEN: &str = "8";
+///
+/// Passed as a single `--abbrev=N` argument: split across two, git reads the
+/// number as a commit-ish and refuses to run alongside `--dirty`.
+const ABBREV: &str = "--abbrev=8";
 
 fn main() {
     let version = describe().unwrap_or_else(|| UNKNOWN.to_string());
@@ -55,8 +58,7 @@ fn describe() -> Option<String> {
             "--tags",
             "--long",
             "--always",
-            "--abbrev",
-            HASH_LEN,
+            ABBREV,
             "--dirty=.dirty",
         ])
         .output()

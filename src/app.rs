@@ -1959,10 +1959,13 @@ mod tests {
     }
 
     #[test]
-    fn the_version_is_resolved_at_build_time() {
-        // Supplied by build.rs from `git describe`, never from Cargo.toml.
-        assert!(VERSION.starts_with('v'), "unexpected version {VERSION:?}");
-        assert!(VERSION.len() > 1);
+    fn the_version_is_resolved_from_git_at_build_time() {
+        // Rejects the placeholder a failed `git describe` falls back to, which
+        // is otherwise indistinguishable from a real version at a glance.
+        assert!(
+            crate::version_format::is_well_formed(VERSION),
+            "build.rs produced {VERSION:?}, which names no commit"
+        );
     }
 
     #[test]
