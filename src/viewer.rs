@@ -2,17 +2,24 @@
 
 use egui::{Rect, Vec2};
 
+/// Hard ceiling on magnification, well past pixel-peeping range.
+pub const MAX_SCALE: f32 = 40.0;
+
+/// Absolute floor, only reached for degenerate image sizes.
+const ABSOLUTE_MIN_SCALE: f32 = 0.01;
+
 /// Viewport transform for the detail view.
 ///
-/// Zoom is stored as a scale factor relative to "fit to window"; panning is an
-/// offset in screen pixels from the centred position.
+/// `scale` is true pixel scale: 1.0 draws one image pixel per point.
 #[derive(Debug, Clone, Copy)]
 pub struct ZoomPan {
     pub scale: f32,
     pub offset: Vec2,
-    /// Set when the view should re-fit on the next frame, e.g. after the
-    /// selected image changes.
+    /// Set when the view should re-fit, e.g. after the selection changes.
     pub needs_fit: bool,
+    /// Smallest scale the user can reach, derived from the current image and
+    /// viewport by [`ZoomPan::set_bounds`].
+    min_scale: f32,
 }
 
 impl Default for ZoomPan {
@@ -21,26 +28,57 @@ impl Default for ZoomPan {
             scale: 1.0,
             offset: Vec2::ZERO,
             needs_fit: true,
+            min_scale: ABSOLUTE_MIN_SCALE,
         }
     }
 }
-
-pub const MIN_SCALE: f32 = 0.05;
-pub const MAX_SCALE: f32 = 40.0;
 
 impl ZoomPan {
     pub fn reset(&mut self) {
         *self = Self::default();
     }
 
-    /// Scale that fits `image` inside `viewport` without cropping.
+    pub fn min_scale(&self) -> f32 {
+        self.min_scale
+    }
+
+    /// Scale at which `image` exactly fits inside `viewport`.
     pub fn fit_scale(image: Vec2, viewport: Vec2) -> f32 {
-        if image.x <= 0.0 || image.y <= 0.0 {
+        if image.x <= 0.0 || image.y <= 0.0 || !image.is_finite() {
             return 1.0;
         }
         (viewport.x / image.x)
             .min(viewport.y / image.y)
-            .max(MIN_SCALE)
+            .max(ABSOLUTE_MIN_SCALE)
+    }
+
+    /// Smallest *useful* scale for this image and viewport.
+    ///
+    /// Zooming out further than "the whole image is visible" only shrinks the
+    /// picture into empty space, so that is the floor. An image smaller than
+    /// the viewport stops at 1:1 instead, since blowing it up to fill the
+    /// window would only magnify its pixels.
+    pub fn min_scale_for(image: Vec2, viewport: Vec2) -> f32 {
+        Self::fit_scale(image, viewport).min(1.0)
+    }
+
+    /// Recompute the zoom floor and pull the current scale up to it.
+    ///
+    /// Called every frame because the floor moves when the window resizes or
+    /// a higher-resolution rendition replaces a preview.
+    pub fn set_bounds(&mut self, image: Vec2, viewport: Vec2) {
+        self.min_scale = Self::min_scale_for(image, viewport);
+        if self.scale < self.min_scale {
+            self.scale = self.min_scale;
+        }
+    }
+
+    /// Fit the image to the viewport, or show it 1:1 if it is smaller.
+    pub fn fit(&mut self, image: Vec2, viewport: Vec2) {
+        self.set_bounds(image, viewport);
+        self.scale = self.min_scale;
+        self.offset = Vec2::ZERO;
+        self.needs_fit = false;
     }
 
     /// Zoom by `factor`, keeping the image point under `anchor` stationary.
@@ -49,7 +87,7 @@ impl ZoomPan {
     /// about the centre instead makes the target drift away as you magnify.
     pub fn zoom_at(&mut self, factor: f32, anchor: egui::Pos2, viewport: Rect) {
         let old = self.scale;
-        let new = (old * factor).clamp(MIN_SCALE, MAX_SCALE);
+        let new = (old * factor).clamp(self.min_scale, MAX_SCALE);
         if (new - old).abs() < f32::EPSILON {
             return;
         }
@@ -73,13 +111,24 @@ impl ZoomPan {
         Rect::from_center_size(viewport.center() + self.offset, scaled)
     }
 
-    /// Keep the image from being dragged entirely off screen.
+    /// Constrain panning so the image cannot be dragged away from the view.
+    ///
+    /// An axis that fits entirely is centred: sliding a fully visible image
+    /// around the void serves no purpose. An axis larger than the viewport is
+    /// limited to its own edges, so no empty gap can open beside it.
     pub fn clamp_to(&mut self, size: Vec2, viewport: Rect) {
         let scaled = size * self.scale;
-        // Always leave a sliver visible so the image can be recovered.
-        let margin = viewport.size() * 0.5 + scaled * 0.5 - Vec2::splat(32.0);
-        self.offset.x = self.offset.x.clamp(-margin.x.max(0.0), margin.x.max(0.0));
-        self.offset.y = self.offset.y.clamp(-margin.y.max(0.0), margin.y.max(0.0));
+        let limit = |scaled: f32, avail: f32, offset: f32| -> f32 {
+            if scaled <= avail {
+                0.0
+            } else {
+                let max = (scaled - avail) * 0.5;
+                offset.clamp(-max, max)
+            }
+        };
+
+        self.offset.x = limit(scaled.x, viewport.width(), self.offset.x);
+        self.offset.y = limit(scaled.y, viewport.height(), self.offset.y);
     }
 }
 
@@ -94,12 +143,10 @@ mod tests {
 
     #[test]
     fn fit_scale_uses_the_limiting_axis() {
-        // A wide image is limited by width.
         assert_eq!(
             ZoomPan::fit_scale(vec2(2000.0, 800.0), vec2(1000.0, 800.0)),
             0.5
         );
-        // A tall image is limited by height.
         assert_eq!(
             ZoomPan::fit_scale(vec2(1000.0, 1600.0), vec2(1000.0, 800.0)),
             0.5
@@ -112,16 +159,77 @@ mod tests {
     }
 
     #[test]
+    fn a_large_image_cannot_be_zoomed_out_past_fitting() {
+        let vp = viewport();
+        let image = vec2(2000.0, 1600.0);
+        let mut zp = ZoomPan::default();
+        zp.fit(image, vp.size());
+
+        // Fit is the floor, so the image always fills one axis of the view.
+        assert_eq!(zp.scale, 0.5);
+
+        for _ in 0..50 {
+            zp.zoom_at(0.5, vp.center(), vp);
+        }
+        assert_eq!(
+            zp.scale, 0.5,
+            "zooming out past fit leaves the image stranded in empty space"
+        );
+    }
+
+    #[test]
+    fn a_small_image_stops_at_one_to_one() {
+        let vp = viewport();
+        // Smaller than the viewport: fitting would upscale it 3x.
+        let image = vec2(320.0, 240.0);
+        let mut zp = ZoomPan::default();
+        zp.fit(image, vp.size());
+
+        assert_eq!(zp.scale, 1.0, "a small image should open at native size");
+
+        for _ in 0..50 {
+            zp.zoom_at(0.5, vp.center(), vp);
+        }
+        assert_eq!(zp.scale, 1.0);
+    }
+
+    #[test]
+    fn zoom_in_is_still_capped() {
+        let vp = viewport();
+        let mut zp = ZoomPan::default();
+        zp.fit(vec2(2000.0, 1600.0), vp.size());
+
+        for _ in 0..100 {
+            zp.zoom_at(2.0, vp.center(), vp);
+        }
+        assert_eq!(zp.scale, MAX_SCALE);
+    }
+
+    #[test]
+    fn resizing_the_window_raises_the_floor() {
+        let image = vec2(2000.0, 1600.0);
+        let mut zp = ZoomPan::default();
+        zp.fit(image, vec2(1000.0, 800.0));
+        assert_eq!(zp.scale, 0.5);
+
+        // Shrinking the window lowers the fit scale; the current scale stays.
+        zp.set_bounds(image, vec2(500.0, 400.0));
+        assert_eq!(zp.min_scale(), 0.25);
+        assert_eq!(zp.scale, 0.5);
+
+        // Growing it raises the floor, which must pull the scale up with it.
+        zp.set_bounds(image, vec2(4000.0, 3200.0));
+        assert_eq!(zp.min_scale(), 1.0);
+        assert_eq!(zp.scale, 1.0);
+    }
+
+    #[test]
     fn zoom_keeps_the_anchored_point_stationary() {
         let vp = viewport();
         let size = vec2(1000.0, 800.0);
-        let mut zp = ZoomPan {
-            scale: 1.0,
-            offset: Vec2::ZERO,
-            needs_fit: false,
-        };
+        let mut zp = ZoomPan::default();
+        zp.fit(size, vp.size());
 
-        // Point in image space under the cursor before zooming.
         let anchor = pos2(700.0, 300.0);
         let before = (anchor - zp.image_rect(size, vp).min) / zp.scale;
 
@@ -135,19 +243,40 @@ mod tests {
     }
 
     #[test]
-    fn zoom_is_clamped_at_both_ends() {
+    fn a_fitted_image_stays_centred() {
         let vp = viewport();
+        let image = vec2(2000.0, 1600.0);
         let mut zp = ZoomPan::default();
+        zp.fit(image, vp.size());
 
-        for _ in 0..100 {
-            zp.zoom_at(2.0, vp.center(), vp);
-        }
-        assert_eq!(zp.scale, MAX_SCALE);
+        zp.pan(vec2(400.0, -300.0));
+        zp.clamp_to(image, vp);
 
-        for _ in 0..200 {
-            zp.zoom_at(0.5, vp.center(), vp);
-        }
-        assert_eq!(zp.scale, MIN_SCALE);
+        // At fit the whole image is visible, so dragging must not move it.
+        assert_eq!(zp.offset, Vec2::ZERO);
+    }
+
+    #[test]
+    fn a_zoomed_image_cannot_be_dragged_past_its_own_edge() {
+        let vp = viewport();
+        let image = vec2(2000.0, 1600.0);
+        let mut zp = ZoomPan::default();
+        zp.fit(image, vp.size());
+        zp.zoom_at(4.0, vp.center(), vp);
+
+        zp.pan(vec2(100_000.0, 100_000.0));
+        zp.clamp_to(image, vp);
+
+        // No empty gap may open between the image edge and the viewport edge.
+        let rect = zp.image_rect(image, vp);
+        assert!(
+            rect.min.x <= vp.min.x + 0.01 && rect.max.x >= vp.max.x - 0.01,
+            "horizontal gap opened: {rect:?} vs {vp:?}"
+        );
+        assert!(
+            rect.min.y <= vp.min.y + 0.01 && rect.max.y >= vp.max.y - 0.01,
+            "vertical gap opened: {rect:?} vs {vp:?}"
+        );
     }
 
     #[test]
@@ -159,26 +288,6 @@ mod tests {
 
         zp.reset();
         assert_eq!(zp.offset, Vec2::ZERO);
-        assert_eq!(zp.scale, 1.0);
         assert!(zp.needs_fit);
-    }
-
-    #[test]
-    fn clamping_keeps_the_image_reachable() {
-        let vp = viewport();
-        let size = vec2(500.0, 400.0);
-        let mut zp = ZoomPan {
-            scale: 1.0,
-            offset: vec2(100_000.0, 100_000.0),
-            needs_fit: false,
-        };
-
-        zp.clamp_to(size, vp);
-
-        let rect = zp.image_rect(size, vp);
-        assert!(
-            rect.intersects(vp),
-            "image was allowed to leave the viewport entirely"
-        );
     }
 }

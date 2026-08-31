@@ -21,6 +21,12 @@ const PAGE_LOOKAHEAD: usize = 30;
 
 const STORAGE_KEY: &str = "npv_filters";
 
+/// Back-navigation label.
+///
+/// egui's default fonts have no arrow glyphs (U+2190 and the emoji arrows all
+/// render as tofu), so this uses a guillemet, which they do provide.
+const BACK_LABEL: &str = "\u{2039} Gallery";
+
 #[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Filters {
     pub sol: String,
@@ -279,9 +285,11 @@ impl App {
         egui::Panel::bottom("status").show(ui, |ui| {
             ui.horizontal(|ui| {
                 if self.fetcher.is_online() {
-                    ui.colored_label(Color32::from_rgb(90, 180, 110), "● online");
+                    status_dot(ui, Color32::from_rgb(90, 180, 110));
+                    ui.colored_label(Color32::from_rgb(90, 180, 110), "online");
                 } else {
-                    ui.colored_label(Color32::from_rgb(230, 160, 60), "● offline");
+                    status_dot(ui, Color32::from_rgb(230, 160, 60));
+                    ui.colored_label(Color32::from_rgb(230, 160, 60), "offline");
                 }
 
                 if self.serving_stale {
@@ -455,7 +463,7 @@ impl App {
         let image = self.images[idx].clone();
 
         ui.horizontal(|ui| {
-            if ui.button("← Gallery").clicked() {
+            if ui.button(BACK_LABEL).clicked() {
                 self.selected = None;
             }
             ui.separator();
@@ -524,9 +532,11 @@ impl App {
 
         let img_size = texture.size_vec2();
         if self.zoom.needs_fit {
-            self.zoom.scale = ZoomPan::fit_scale(img_size, viewport.size());
-            self.zoom.offset = Vec2::ZERO;
-            self.zoom.needs_fit = false;
+            self.zoom.fit(img_size, viewport.size());
+        } else {
+            // The floor moves when the window resizes or a higher-resolution
+            // rendition replaces the preview.
+            self.zoom.set_bounds(img_size, viewport.size());
         }
 
         if response.dragged() {
@@ -618,6 +628,17 @@ impl App {
             _ => self.gallery(ui),
         });
     }
+}
+
+/// Draw the connectivity dot.
+///
+/// Painted rather than written, because the obvious glyphs for it (U+25CF and
+/// friends) are missing from egui's default fonts.
+fn status_dot(ui: &mut egui::Ui, color: Color32) {
+    let diameter = 8.0;
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(diameter), egui::Sense::hover());
+    ui.painter()
+        .circle_filled(rect.center(), diameter * 0.5, color);
 }
 
 /// How many thumbnails fit across `width`.
@@ -815,6 +836,74 @@ mod tests {
         assert_eq!(harness.state().selected, Some(0));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn every_ui_label_is_renderable_in_the_default_fonts() {
+        // egui's default fonts lack many symbol glyphs, which silently render
+        // as tofu boxes. Anything shown as text must be checked.
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(Default::default(), |_| {});
+        output.textures_delta.clear();
+
+        let labels = [
+            BACK_LABEL,
+            "Fit",
+            "\u{2212}",
+            "+",
+            "Load full resolution",
+            "Save\u{2026}",
+            "full resolution",
+            "Gallery",
+            "Clear",
+            "reset",
+            "dismiss",
+            "online",
+            "offline",
+            "Perseverance",
+            "Sol",
+            "Order",
+            "Cameras",
+            "Newest first",
+            "Oldest first",
+            "Date taken",
+            "Loading\u{2026}",
+            "Loading image\u{2026}",
+            "No images match these filters.",
+            "\u{2026}",
+            "Sol must be a number",
+            "\u{00b7} showing cached results",
+            "Sol 1000 \u{00b7} NAVCAM_LEFT",
+        ];
+
+        let font = egui::FontId::proportional(14.0);
+        ctx.fonts_mut(|f| {
+            for label in labels {
+                for c in label.chars().filter(|c| !c.is_whitespace()) {
+                    assert!(
+                        f.has_glyph(&font, c),
+                        "{c:?} (U+{:04X}) in {label:?} has no glyph and will render as tofu",
+                        c as u32
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn camera_names_are_renderable() {
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(Default::default(), |_| {});
+        output.textures_delta.clear();
+
+        let font = egui::FontId::proportional(14.0);
+        ctx.fonts_mut(|f| {
+            for cam in MARS2020_CAMERAS {
+                for c in cam.chars() {
+                    assert!(f.has_glyph(&font, c), "{c:?} in {cam} has no glyph");
+                }
+            }
+        });
     }
 
     #[test]
