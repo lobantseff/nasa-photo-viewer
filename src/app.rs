@@ -66,6 +66,9 @@ const PREFETCH_RADIUS: usize = 3;
 /// Width of the filter sidebar.
 const SIDEBAR_WIDTH: f32 = 230.0;
 
+/// Height of the scrollable camera list.
+const CAMERA_LIST_HEIGHT: f32 = 320.0;
+
 /// Width of the sol slider's track, narrowed from egui's default so the
 /// "Reset" button shares its row within the sidebar.
 const SOL_SLIDER_WIDTH: f32 = 76.0;
@@ -377,20 +380,7 @@ impl App {
                     }
                 });
 
-                egui::ScrollArea::vertical()
-                    .max_height(320.0)
-                    .show(ui, |ui| {
-                        for cam in MARS2020_CAMERAS {
-                            let mut on = self.filters.cameras.iter().any(|c| c == cam);
-                            if ui.checkbox(&mut on, *cam).changed() {
-                                if on {
-                                    self.filters.cameras.push((*cam).to_string());
-                                } else {
-                                    self.filters.cameras.retain(|c| c != cam);
-                                }
-                            }
-                        }
-                    });
+                camera_list(ui, &mut self.filters.cameras);
 
                 if self.filters != before {
                     self.reset_for_new_filters();
@@ -910,6 +900,28 @@ impl App {
     }
 }
 
+/// The scrollable list of camera checkboxes.
+fn camera_list(ui: &mut egui::Ui, selected: &mut Vec<String>) {
+    egui::ScrollArea::vertical()
+        // Fill the available width rather than shrinking to the widest camera
+        // name, which strands the scroll bar mid-panel with dead space beside
+        // it and lets the floating bar overlap the longest label.
+        .auto_shrink([false, true])
+        .max_height(CAMERA_LIST_HEIGHT)
+        .show(ui, |ui| {
+            for cam in MARS2020_CAMERAS {
+                let mut on = selected.iter().any(|c| c == cam);
+                if ui.checkbox(&mut on, *cam).changed() {
+                    if on {
+                        selected.push((*cam).to_string());
+                    } else {
+                        selected.retain(|c| c != cam);
+                    }
+                }
+            }
+        });
+}
+
 /// Draw the connectivity dot.
 ///
 /// Painted rather than written, because the obvious glyphs for it (U+25CF and
@@ -1388,6 +1400,28 @@ mod tests {
         assert_eq!(app.textures.count(Tier::Thumbnail), before);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_camera_list_claims_the_full_width_available_to_it() {
+        // The camera names are narrower than the panel, so a scroll area left
+        // to shrink to its content claims only that much width and leaves its
+        // scroll bar floating well inside the panel edge.
+        let ctx = egui::Context::default();
+        let mut cameras = Vec::new();
+        let (mut available, mut claimed) = (0.0_f32, 0.0_f32);
+
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            available = ui.available_width();
+            camera_list(ui, &mut cameras);
+            claimed = ui.min_rect().width();
+        });
+        output.textures_delta.clear();
+
+        assert!(
+            claimed >= available - 1.0,
+            "camera list claimed {claimed} of {available} available"
+        );
     }
 
     #[test]
