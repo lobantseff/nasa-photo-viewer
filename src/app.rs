@@ -179,6 +179,8 @@ pub struct App {
     total_results: Option<u64>,
     next_page: u64,
     exhausted: bool,
+    /// Page 0 was shown stale and is being refreshed before pagination starts.
+    refreshing_first_page: bool,
     textures: TextureStore,
     selected: Option<usize>,
     zoom: ZoomPan,
@@ -244,6 +246,7 @@ impl App {
             total_results: None,
             next_page: 0,
             exhausted: false,
+            refreshing_first_page: false,
             textures: TextureStore::default(),
             selected: None,
             zoom: ZoomPan::default(),
@@ -280,7 +283,9 @@ impl App {
 
         if cached.stale {
             // Page 0 is what the user is looking at, so refresh that rather
-            // than only paging onwards.
+            // than only paging onwards. Do not request page 1 concurrently:
+            // replacing stale page 0 would either discard it or misorder it.
+            self.refreshing_first_page = true;
             self.fetcher.request_listing(&query, 0);
         }
     }
@@ -333,6 +338,7 @@ impl App {
         self.total_results = None;
         self.next_page = 0;
         self.exhausted = false;
+        self.refreshing_first_page = false;
         self.serving_stale = false;
         self.pending_advance = false;
         self.error = None;
@@ -341,7 +347,7 @@ impl App {
     }
 
     fn request_more(&mut self) {
-        if self.exhausted || self.filters.no_cameras_enabled() {
+        if self.exhausted || self.refreshing_first_page || self.filters.no_cameras_enabled() {
             return;
         }
         let query = self.filters.to_query();
@@ -375,15 +381,28 @@ impl App {
                     let handle = ctx.load_texture(url.clone(), *image, TextureOptions::LINEAR);
                     self.textures.insert(url, handle, tier);
                 }
-                Update::Failed { error, .. } => self.error = Some(error),
+                Update::Failed { key, error } => self.handle_failure(&key, error),
                 Update::LatestRelease(latest) => {
-                    self.update_available =
-                        crate::update::evaluate(VERSION, &latest, self.update_dismissed.as_deref());
-                    self.update_modal_open = self.update_available.is_some();
+                    if let Some(latest) = latest {
+                        self.update_available = crate::update::evaluate(
+                            VERSION,
+                            &latest,
+                            self.update_dismissed.as_deref(),
+                        );
+                        self.update_modal_open = self.update_available.is_some();
+                    }
                 }
+                Update::Saved { .. } => {}
                 Update::Connectivity { .. } => {}
             }
         }
+    }
+
+    fn handle_failure(&mut self, key: &str, error: String) {
+        if self.refreshing_first_page && key == format!("listing:{}:0", self.active_key) {
+            self.refreshing_first_page = false;
+        }
+        self.error = Some(error);
     }
 
     /// Fold a listing page into the displayed set.
@@ -397,22 +416,51 @@ impl App {
         // A freshly fetched first page supersedes whatever was shown from
         // cache; appending would interleave the two orderings instead of
         // replacing, stranding the stale items at the top.
-        if page == 0 && !from_stale_cache && self.serving_stale {
+        let replacing_stale = page == 0 && !from_stale_cache && self.serving_stale;
+        let selected_id = replacing_stale
+            .then(|| {
+                self.selected
+                    .and_then(|selected| self.visible_image(selected))
+                    .map(|image| image.id().to_string())
+            })
+            .flatten();
+        let had_selection = replacing_stale && self.selected.is_some();
+
+        if replacing_stale {
             self.images.clear();
             self.visible.clear();
             self.seen.clear();
         }
-        self.serving_stale = from_stale_cache;
+        if page == 0 {
+            self.refreshing_first_page = false;
+            self.serving_stale = from_stale_cache;
+        } else if from_stale_cache {
+            self.serving_stale = true;
+        }
         self.total_results = total_results.or(self.total_results);
 
         if images.is_empty() {
             self.exhausted = true;
-            return;
+        } else {
+            if page >= self.next_page {
+                self.next_page = page + 1;
+            }
+            self.absorb(images);
         }
-        if page >= self.next_page {
-            self.next_page = page + 1;
+
+        if had_selection {
+            self.selected = selected_id.and_then(|id| {
+                self.visible
+                    .iter()
+                    .position(|&position| self.images[position].id() == id)
+            });
+            if self.selected.is_none() {
+                self.pending_advance = false;
+                self.shown_size = None;
+                self.full_res_pending = false;
+                self.zoom.reset();
+            }
         }
-        self.absorb(images);
     }
 
     fn sidebar(&mut self, ui: &mut egui::Ui) {
@@ -527,7 +575,8 @@ impl App {
                 // fetch and a burst of thumbnails look identical otherwise.
                 let listings = self.fetcher.inflight_listings();
                 let images = self.fetcher.inflight_images();
-                if listings > 0 || images > 0 {
+                let saves = self.fetcher.inflight_saves();
+                if listings > 0 || images > 0 || saves > 0 {
                     ui.spinner();
                 }
                 if listings > 0 {
@@ -535,6 +584,9 @@ impl App {
                 }
                 if images > 0 {
                     ui.label(format!("{images} image(s) loading"));
+                }
+                if saves > 0 {
+                    ui.label("saving image…");
                 }
 
                 let error = self.error.clone();
@@ -973,10 +1025,8 @@ impl App {
                 // here would shift the buttons beside it.
                 if ui.button("Save…").clicked() {
                     let name = format!("{}.png", image.id());
-                    if let Some(path) = rfd::FileDialog::new().set_file_name(name).save_file()
-                        && let Err(err) = self.fetcher.save_image_to(&full, path)
-                    {
-                        self.error = Some(err.to_string());
+                    if let Some(path) = rfd::FileDialog::new().set_file_name(name).save_file() {
+                        self.fetcher.request_save_image(&full, path);
                     }
                 }
             }
@@ -1734,6 +1784,90 @@ mod tests {
     }
 
     #[test]
+    fn a_stale_first_page_is_refreshed_before_paging() {
+        let dir = temp_cache_dir();
+        let cache = Cache::open_at(&dir, DEFAULT_CACHE_BUDGET).unwrap();
+        let mut app = offline_app(egui::Context::default(), cache);
+        app.serving_stale = true;
+        app.refreshing_first_page = true;
+        app.next_page = 1;
+
+        let before = app.fetcher.issued_count();
+        app.request_more();
+        assert_eq!(
+            app.fetcher.issued_count(),
+            before,
+            "page 1 must not race the page 0 replacement"
+        );
+
+        app.merge_listing(0, false, vec![test_image("NEW")], Some(2));
+        app.request_more();
+        assert_eq!(app.fetcher.issued_count(), before + 1);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_failed_stale_refresh_allows_cached_pagination_to_continue() {
+        let dir = temp_cache_dir();
+        let cache = Cache::open_at(&dir, DEFAULT_CACHE_BUDGET).unwrap();
+        let mut app = offline_app(egui::Context::default(), cache);
+        app.serving_stale = true;
+        app.refreshing_first_page = true;
+        app.next_page = 1;
+
+        let key = format!("listing:{}:0", app.active_key);
+        app.handle_failure(&key, "offline".to_string());
+        assert!(!app.refreshing_first_page);
+
+        let before = app.fetcher.issued_count();
+        app.request_more();
+        assert_eq!(
+            app.fetcher.issued_count(),
+            before + 1,
+            "cached page 1 should still be available while offline"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_stale_selection_is_closed_if_refresh_removes_its_image() {
+        let dir = temp_cache_dir();
+        let cache = Cache::open_at(&dir, DEFAULT_CACHE_BUDGET).unwrap();
+        let mut app = offline_app(egui::Context::default(), cache);
+        app.serving_stale = true;
+        app.absorb(vec![test_image("OLD1"), test_image("OLD2")]);
+        app.selected = Some(1);
+
+        app.merge_listing(0, false, vec![test_image("NEW")], Some(1));
+
+        assert_eq!(
+            app.selected, None,
+            "refreshing must not silently switch the open detail to another image"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_stale_selection_follows_its_image_through_refresh() {
+        let dir = temp_cache_dir();
+        let cache = Cache::open_at(&dir, DEFAULT_CACHE_BUDGET).unwrap();
+        let mut app = offline_app(egui::Context::default(), cache);
+        app.serving_stale = true;
+        app.absorb(vec![test_image("A"), test_image("B")]);
+        app.selected = Some(1);
+
+        app.merge_listing(0, false, vec![test_image("B"), test_image("A")], Some(2));
+
+        assert_eq!(app.selected, Some(0));
+        assert_eq!(app.visible_image(0).unwrap().id(), "B");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn a_later_fresh_page_appends_rather_than_replacing() {
         let dir = temp_cache_dir();
         let cache = Cache::open_at(&dir, DEFAULT_CACHE_BUDGET).unwrap();
@@ -1745,6 +1879,10 @@ mod tests {
         app.merge_listing(1, false, vec![test_image("B")], Some(2));
 
         assert_eq!(app.images.len(), 2, "page 1 must extend, not replace");
+        assert!(
+            app.serving_stale,
+            "a fresh later page does not make stale page 0 current"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2761,6 +2899,7 @@ mod tests {
             "+",
             "Save\u{2026}",
             "fetching more results…",
+            "saving image…",
             "Gallery",
             "Clear",
             "reset",

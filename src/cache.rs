@@ -242,9 +242,10 @@ impl Cache {
 
         match std::fs::read(&path) {
             Ok(bytes) => {
+                let accessed_at = self.next_access()?;
                 self.db.execute(
                     "UPDATE blobs SET accessed_at = ?2 WHERE url = ?1",
-                    params![url, now_secs()],
+                    params![url, accessed_at],
                 )?;
                 Ok(Some(bytes))
             }
@@ -265,17 +266,37 @@ impl Cache {
         std::fs::write(&path, bytes)
             .with_context(|| format!("writing cached blob {}", path.display()))?;
 
+        let accessed_at = self.next_access()?;
         self.db.execute(
             "INSERT INTO blobs (url, path, bytes, accessed_at) VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(url) DO UPDATE SET
                  path = excluded.path,
                  bytes = excluded.bytes,
                  accessed_at = excluded.accessed_at",
-            params![url, path.to_string_lossy(), bytes.len() as i64, now_secs()],
+            params![url, path.to_string_lossy(), bytes.len() as i64, accessed_at],
         )?;
 
         self.evict_to_budget()?;
         Ok(path)
+    }
+
+    /// Remove cached bytes and their index entry.
+    pub fn remove_blob(&self, url: &str) -> Result<bool> {
+        let path = self
+            .db
+            .query_row("SELECT path FROM blobs WHERE url = ?1", params![url], |r| {
+                r.get::<_, String>(0)
+            })
+            .optional()?;
+
+        let Some(path) = path else {
+            return Ok(false);
+        };
+
+        remove_blob_file(Path::new(&path))?;
+        self.db
+            .execute("DELETE FROM blobs WHERE url = ?1", params![url])?;
+        Ok(true)
     }
 
     /// Total bytes tracked in the blob cache.
@@ -313,8 +334,7 @@ impl Cache {
             if total <= self.budget {
                 break;
             }
-            // Ignore a missing file: the index row still must go.
-            let _ = std::fs::remove_file(&path);
+            remove_blob_file(Path::new(&path))?;
             self.db
                 .execute("DELETE FROM blobs WHERE url = ?1", params![url])?;
             total = total.saturating_sub(bytes);
@@ -322,6 +342,18 @@ impl Cache {
         }
 
         Ok(freed)
+    }
+
+    /// A logical clock gives every access a strict order. Wall-clock seconds
+    /// make a burst of downloads tie, at which point eviction is no longer LRU.
+    fn next_access(&self) -> Result<i64> {
+        self.db
+            .query_row(
+                "SELECT COALESCE(MAX(accessed_at), 0) + 1 FROM blobs",
+                [],
+                |r| r.get(0),
+            )
+            .context("advancing the blob access clock")
     }
 }
 
@@ -357,6 +389,15 @@ fn blob_name(url: &str) -> String {
         .unwrap_or("img");
 
     format!("{hash}.{ext}")
+}
+
+fn remove_blob_file(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        // The index row still has to go if the file was removed externally.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("removing cached blob {}", path.display())),
+    }
 }
 
 fn now_secs() -> i64 {
@@ -499,6 +540,24 @@ mod tests {
     }
 
     #[test]
+    fn removing_a_blob_drops_its_file_and_index_entry() {
+        let dir = temp_dir("remove");
+        let cache = Cache::open_at(&dir, DEFAULT_CACHE_BUDGET).unwrap();
+        let url = "https://x/a.jpg";
+        let path = cache.put_blob(url, b"hello").unwrap();
+
+        assert!(cache.remove_blob(url).unwrap());
+        assert!(!path.exists());
+        assert_eq!(cache.blob_bytes().unwrap(), 0);
+        assert!(
+            !cache.remove_blob(url).unwrap(),
+            "an absent blob is a no-op"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn evicts_least_recently_used_blobs_over_budget() {
         let dir = temp_dir("evict");
         let cache = Cache::open_at(&dir, 100).unwrap();
@@ -506,13 +565,7 @@ mod tests {
         cache.put_blob("https://x/old.jpg", &[0u8; 60]).unwrap();
         cache.put_blob("https://x/mid.jpg", &[0u8; 30]).unwrap();
         // Touch the oldest so recency, not insertion order, decides.
-        cache
-            .db
-            .execute(
-                "UPDATE blobs SET accessed_at = ?1 WHERE url = 'https://x/old.jpg'",
-                params![now_secs() + 500],
-            )
-            .unwrap();
+        assert!(cache.blob("https://x/old.jpg").unwrap().is_some());
 
         cache.put_blob("https://x/new.jpg", &[0u8; 30]).unwrap();
 
