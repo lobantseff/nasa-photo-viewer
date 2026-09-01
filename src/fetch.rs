@@ -369,11 +369,21 @@ impl Fetcher {
 
         self.rt.spawn(async move {
             let result = async {
-                let cached = {
-                    cache
-                        .lock()
-                        .map_err(|_| anyhow::anyhow!("cache lock poisoned"))?
-                        .blob(&url)?
+                let cached = match cache
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("cache lock poisoned"))
+                    .and_then(|cache| cache.blob(&url))
+                {
+                    Ok(cached) => cached,
+                    Err(err) => {
+                        // Saving does not depend on the cache. Report the
+                        // problem, then fall back to a direct download.
+                        let _ = tx.send(Update::Failed {
+                            key: format!("cache:{url}"),
+                            error: format!("reading cached image before save: {err}"),
+                        });
+                        None
+                    }
                 };
 
                 match cached {
@@ -466,7 +476,6 @@ mod tests {
     }
 
     /// Collect updates until all requested work reaches a terminal state.
-    #[cfg(unix)]
     fn wait_until_idle(fetcher: &mut Fetcher) -> Vec<Update> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let mut updates = Vec::new();
@@ -483,7 +492,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     fn serve_png_once() -> (String, std::thread::JoinHandle<()>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/image.png", listener.local_addr().unwrap());
@@ -693,6 +701,34 @@ mod tests {
             0,
             "a failed save must not leave the status spinner stuck"
         );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_cache_read_error_does_not_block_a_direct_save() {
+        let dir = temp_dir("save-cache-error");
+        let dest = dir.join("saved.png");
+        let (url, server) = serve_png_once();
+        let cache = Cache::open_at(&dir, DEFAULT_CACHE_BUDGET).unwrap();
+        let path = cache.put_blob(&url, b"cached bytes").unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let client = Client::with_endpoint("http://127.0.0.1:1/").unwrap();
+        let mut fetcher = Fetcher::with_client(egui::Context::default(), cache, client).unwrap();
+
+        fetcher.request_save_image(&url, dest.clone());
+        let updates = wait_until_idle(&mut fetcher);
+        server.join().unwrap();
+
+        assert!(
+            updates
+                .iter()
+                .any(|u| matches!(u, Update::Failed { key, .. } if key == &format!("cache:{url}"))),
+            "the cache read error must still be surfaced"
+        );
+        assert!(updates.iter().any(|u| matches!(u, Update::Saved { .. })));
+        assert_eq!(std::fs::read(dest).unwrap(), red_png());
 
         std::fs::remove_dir_all(&dir).ok();
     }
