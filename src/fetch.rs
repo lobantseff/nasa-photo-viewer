@@ -255,10 +255,15 @@ impl Fetcher {
                             .lock()
                             .map_err(|_| anyhow::anyhow!("cache lock poisoned"))
                             .and_then(|cache| cache.remove_blob(&url));
-                        match removed {
-                            Ok(_) => download_and_decode(&client, &cache, &tx, &url).await,
-                            Err(err) => Err(err),
+                        if let Err(err) = removed {
+                            // Cleanup failure should be visible, but must not
+                            // prevent the network copy from being usable now.
+                            let _ = tx.send(Update::Failed {
+                                key: format!("cache:{url}"),
+                                error: format!("removing corrupt cached image: {err}"),
+                            });
                         }
+                        download_and_decode(&client, &cache, &tx, &url).await
                     }
                 },
                 Ok(None) => download_and_decode(&client, &cache, &tx, &url).await,
@@ -347,7 +352,10 @@ impl Fetcher {
         });
     }
 
-    /// Copy a cached image to `dest`, fetching it first if necessary.
+    /// Queue a background copy to `dest`, fetching it first if necessary.
+    ///
+    /// Returns immediately; [`Self::poll`] reports completion as
+    /// [`Update::Saved`] or [`Update::Failed`].
     pub fn request_save_image(&mut self, url: &str, dest: std::path::PathBuf) {
         let key = format!("save:{url}:{}", dest.display());
         if !self.inflight.insert(key.clone()) {
@@ -455,6 +463,56 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
+    }
+
+    /// Collect updates until all requested work reaches a terminal state.
+    #[cfg(unix)]
+    fn wait_until_idle(fetcher: &mut Fetcher) -> Vec<Update> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut updates = Vec::new();
+        loop {
+            updates.extend(fetcher.poll());
+            if fetcher.inflight_count() == 0 {
+                return updates;
+            }
+            assert!(
+                std::time::Instant::now() <= deadline,
+                "background work did not finish"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    #[cfg(unix)]
+    fn serve_png_once() -> (String, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/image.png", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request).unwrap();
+            let png = red_png();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                png.len()
+            )
+            .unwrap();
+            stream.write_all(png).unwrap();
+        });
+        (url, server)
+    }
+
+    fn red_png() -> &'static [u8] {
+        &[
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
+            0x00, 0x90, 0x77, 0x53, 0xde, 0x00, 0x00, 0x00, 0x0c, 0x49, 0x44, 0x41, 0x54, 0x08,
+            0xd7, 0x63, 0xf8, 0xcf, 0xc0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xdd, 0x8d,
+            0xb0, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+        ]
     }
 
     #[test]
@@ -660,18 +718,46 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_cache_removal_error_does_not_block_the_network_retry() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = temp_dir("corrupt-removal");
+        let (url, server) = serve_png_once();
+        let cache = Cache::open_at(&dir, DEFAULT_CACHE_BUDGET).unwrap();
+        let path = cache.put_blob(&url, b"not an image").unwrap();
+        let blob_dir = path.parent().unwrap();
+        let mut permissions = std::fs::metadata(blob_dir).unwrap().permissions();
+        permissions.set_mode(0o555);
+        std::fs::set_permissions(blob_dir, permissions).unwrap();
+        let client = Client::with_endpoint("http://127.0.0.1:1/").unwrap();
+        let mut fetcher = Fetcher::with_client(egui::Context::default(), cache, client).unwrap();
+
+        fetcher.request_image(&url, ImageKind::Thumbnail);
+        let updates = wait_until_idle(&mut fetcher);
+        server.join().unwrap();
+        let mut permissions = std::fs::metadata(blob_dir).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(blob_dir, permissions).unwrap();
+
+        assert!(
+            updates
+                .iter()
+                .any(|u| matches!(u, Update::Failed { key, .. } if key == &format!("cache:{url}"))),
+            "the cleanup error must still be surfaced"
+        );
+        assert!(
+            updates.iter().any(|u| matches!(u, Update::Image { .. })),
+            "cleanup failure must not make a valid network response unusable"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn decodes_a_png_into_a_color_image() {
-        // 1x1 red PNG.
-        let png = [
-            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
-            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
-            0x00, 0x90, 0x77, 0x53, 0xde, 0x00, 0x00, 0x00, 0x0c, 0x49, 0x44, 0x41, 0x54, 0x08,
-            0xd7, 0x63, 0xf8, 0xcf, 0xc0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xdd, 0x8d,
-            0xb0, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
-        ];
-
-        let img = decode(&png).unwrap();
+        let img = decode(red_png()).unwrap();
         assert_eq!(img.size, [1, 1]);
     }
 
