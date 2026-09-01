@@ -16,6 +16,7 @@ pub mod fetch;
 pub mod model;
 pub mod query;
 pub mod textures;
+pub mod update;
 /// How a `git describe` string becomes the version the application reports.
 pub mod version_format;
 pub mod viewer;
