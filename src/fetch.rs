@@ -258,16 +258,16 @@ impl Fetcher {
                         if let Err(err) = removed {
                             // Cleanup failure should be visible, but must not
                             // prevent the network copy from being usable now.
-                            let _ = tx.send(Update::Failed {
-                                key: format!("cache:{url}"),
-                                error: format!("removing corrupt cached image: {err}"),
-                            });
+                            report_cache_error(&tx, &url, "removing corrupt cached image", &err);
                         }
                         download_and_decode(&client, &cache, &tx, &url).await
                     }
                 },
                 Ok(None) => download_and_decode(&client, &cache, &tx, &url).await,
-                Err(err) => Err(err),
+                Err(err) => {
+                    report_cache_error(&tx, &url, "reading cached image", &err);
+                    download_and_decode(&client, &cache, &tx, &url).await
+                }
             };
 
             let update = match image {
@@ -378,10 +378,7 @@ impl Fetcher {
                     Err(err) => {
                         // Saving does not depend on the cache. Report the
                         // problem, then fall back to a direct download.
-                        let _ = tx.send(Update::Failed {
-                            key: format!("cache:{url}"),
-                            error: format!("reading cached image before save: {err}"),
-                        });
+                        report_cache_error(&tx, &url, "reading cached image before save", &err);
                         None
                     }
                 };
@@ -406,6 +403,13 @@ impl Fetcher {
             ctx.request_repaint();
         });
     }
+}
+
+fn report_cache_error(tx: &Sender<Update>, url: &str, context: &str, err: &anyhow::Error) {
+    let _ = tx.send(Update::Failed {
+        key: format!("cache:{url}"),
+        error: format!("{context}: {err}"),
+    });
 }
 
 async fn download_and_decode(
@@ -521,6 +525,12 @@ mod tests {
             0xd7, 0x63, 0xf8, 0xcf, 0xc0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xdd, 0x8d,
             0xb0, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
         ]
+    }
+
+    fn replace_blob_with_directory(cache: &Cache, url: &str) {
+        let path = cache.put_blob(url, b"cached bytes").unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(path).unwrap();
     }
 
     #[test]
@@ -711,9 +721,7 @@ mod tests {
         let dest = dir.join("saved.png");
         let (url, server) = serve_png_once();
         let cache = Cache::open_at(&dir, DEFAULT_CACHE_BUDGET).unwrap();
-        let path = cache.put_blob(&url, b"cached bytes").unwrap();
-        std::fs::remove_file(&path).unwrap();
-        std::fs::create_dir(&path).unwrap();
+        replace_blob_with_directory(&cache, &url);
         let client = Client::with_endpoint("http://127.0.0.1:1/").unwrap();
         let mut fetcher = Fetcher::with_client(egui::Context::default(), cache, client).unwrap();
 
@@ -729,6 +737,33 @@ mod tests {
         );
         assert!(updates.iter().any(|u| matches!(u, Update::Saved { .. })));
         assert_eq!(std::fs::read(dest).unwrap(), red_png());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_cache_read_error_does_not_block_a_network_image() {
+        let dir = temp_dir("image-cache-error");
+        let (url, server) = serve_png_once();
+        let cache = Cache::open_at(&dir, DEFAULT_CACHE_BUDGET).unwrap();
+        replace_blob_with_directory(&cache, &url);
+        let client = Client::with_endpoint("http://127.0.0.1:1/").unwrap();
+        let mut fetcher = Fetcher::with_client(egui::Context::default(), cache, client).unwrap();
+
+        fetcher.request_image(&url, ImageKind::Thumbnail);
+        let updates = wait_until_idle(&mut fetcher);
+        server.join().unwrap();
+
+        assert!(
+            updates
+                .iter()
+                .any(|u| matches!(u, Update::Failed { key, .. } if key == &format!("cache:{url}"))),
+            "the cache read error must still be surfaced"
+        );
+        assert!(
+            updates.iter().any(|u| matches!(u, Update::Image { .. })),
+            "an optional cache failure must not hide a valid network image"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
