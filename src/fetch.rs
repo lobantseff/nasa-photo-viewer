@@ -51,9 +51,11 @@ pub enum Update {
     Failed { key: String, error: String },
     /// Network reachability changed.
     Connectivity { online: bool },
-    /// GitHub reported its latest release. Only sent when the check succeeds:
-    /// being unable to reach it is the normal offline case, not news.
-    LatestRelease(crate::update::LatestRelease),
+    /// The GitHub release check completed. `None` keeps an ordinary offline
+    /// failure quiet while still closing the request's lifecycle.
+    LatestRelease(Option<crate::update::LatestRelease>),
+    /// A requested file save completed.
+    Saved { key: String },
 }
 
 /// A listing served from the local cache.
@@ -133,6 +135,14 @@ impl Fetcher {
         self.inflight
             .iter()
             .filter(|k| k.starts_with("image:"))
+            .count()
+    }
+
+    /// Image saves currently writing or downloading.
+    pub fn inflight_saves(&self) -> usize {
+        self.inflight
+            .iter()
+            .filter(|k| k.starts_with("save:"))
             .count()
     }
 
@@ -228,48 +238,50 @@ impl Fetcher {
         let url = url.to_string();
 
         self.rt.spawn(async move {
-            let cached = cache.lock().ok().and_then(|c| c.blob(&url).ok().flatten());
-
-            let bytes = match cached {
-                Some(bytes) => Some(bytes),
-                None => match client.fetch_bytes(&url).await {
-                    Ok(bytes) => {
-                        if let Ok(cache) = cache.lock() {
-                            let _ = cache.put_blob(&url, &bytes);
-                        }
-                        let _ = tx.send(Update::Connectivity { online: true });
-                        Some(bytes)
-                    }
-                    Err(err) => {
-                        let _ = tx.send(Update::Connectivity { online: false });
-                        let _ = tx.send(Update::Failed {
-                            key: format!("image:{url}"),
-                            error: err.to_string(),
-                        });
-                        None
-                    }
-                },
+            let cached = {
+                cache
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("cache lock poisoned"))
+                    .and_then(|cache| cache.blob(&url))
             };
 
-            if let Some(bytes) = bytes {
-                // Decode here rather than on the UI thread: a full-res PNG
-                // takes long enough to drop frames.
-                match decode(&bytes) {
-                    Ok(image) => {
-                        let _ = tx.send(Update::Image {
-                            url,
-                            kind,
-                            image: Box::new(image),
-                        });
+            let image = match cached {
+                Ok(Some(bytes)) => match decode(&bytes) {
+                    Ok(image) => Ok(image),
+                    Err(_) => {
+                        // A partial or externally modified cache file must not
+                        // poison this URL forever. Remove it and retry once.
+                        let removed = cache
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("cache lock poisoned"))
+                            .and_then(|cache| cache.remove_blob(&url));
+                        if let Err(err) = removed {
+                            // Cleanup failure should be visible, but must not
+                            // prevent the network copy from being usable now.
+                            report_cache_error(&tx, &url, "removing corrupt cached image", &err);
+                        }
+                        download_and_decode(&client, &cache, &tx, &url).await
                     }
-                    Err(err) => {
-                        let _ = tx.send(Update::Failed {
-                            key: format!("image:{url}"),
-                            error: err.to_string(),
-                        });
-                    }
+                },
+                Ok(None) => download_and_decode(&client, &cache, &tx, &url).await,
+                Err(err) => {
+                    report_cache_error(&tx, &url, "reading cached image", &err);
+                    download_and_decode(&client, &cache, &tx, &url).await
                 }
-            }
+            };
+
+            let update = match image {
+                Ok(image) => Update::Image {
+                    url,
+                    kind,
+                    image: Box::new(image),
+                },
+                Err(err) => Update::Failed {
+                    key: format!("image:{url}"),
+                    error: err.to_string(),
+                },
+            };
+            let _ = tx.send(update);
 
             ctx.request_repaint();
         });
@@ -290,6 +302,9 @@ impl Fetcher {
                         }
                         Update::Image { url, .. } => {
                             self.inflight.remove(&format!("image:{url}"));
+                        }
+                        Update::Saved { key } => {
+                            self.inflight.remove(key);
                         }
                         Update::Failed { key, .. } => {
                             self.inflight.remove(key);
@@ -313,6 +328,10 @@ impl Fetcher {
     /// reaching GitHub says nothing about whether an update exists, and it
     /// must not be mistaken for the image feed going offline.
     pub fn request_latest_release(&mut self) {
+        self.request_latest_release_from(crate::update::LATEST_RELEASE_API);
+    }
+
+    fn request_latest_release_from(&mut self, url: &str) {
         let key = "release:latest".to_string();
         if !self.inflight.insert(key) {
             return;
@@ -321,38 +340,102 @@ impl Fetcher {
 
         let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
         let client = Arc::clone(&self.client);
+        let url = url.to_string();
 
         self.rt.spawn(async move {
-            if let Ok(bytes) = client.fetch_bytes(crate::update::LATEST_RELEASE_API).await
-                && let Ok(latest) = serde_json::from_slice::<crate::update::LatestRelease>(&bytes)
-            {
-                let _ = tx.send(Update::LatestRelease(latest));
-                ctx.request_repaint();
-            }
+            let latest = match client.fetch_bytes(&url).await {
+                Ok(bytes) => serde_json::from_slice::<crate::update::LatestRelease>(&bytes).ok(),
+                Err(_) => None,
+            };
+            let _ = tx.send(Update::LatestRelease(latest));
+            ctx.request_repaint();
         });
     }
 
-    /// Copy a cached image to `dest`, fetching it first if necessary.
-    pub fn save_image_to(&self, url: &str, dest: std::path::PathBuf) -> Result<()> {
-        let cached = self
-            .cache
-            .lock()
-            .map_err(|_| anyhow::anyhow!("cache lock poisoned"))?
-            .blob(url)?;
+    /// Queue a background copy to `dest`, fetching it first if necessary.
+    ///
+    /// Returns immediately; [`Self::poll`] reports completion as
+    /// [`Update::Saved`] or [`Update::Failed`].
+    pub fn request_save_image(&mut self, url: &str, dest: std::path::PathBuf) {
+        let key = format!("save:{url}:{}", dest.display());
+        if !self.inflight.insert(key.clone()) {
+            return;
+        }
+        self.issued += 1;
 
-        let bytes = match cached {
-            Some(bytes) => bytes,
-            None => {
-                let client = Arc::clone(&self.client);
-                let url = url.to_string();
-                self.rt
-                    .block_on(async move { client.fetch_bytes(&url).await })?
+        let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+        let (client, cache) = (Arc::clone(&self.client), Arc::clone(&self.cache));
+        let url = url.to_string();
+
+        self.rt.spawn(async move {
+            let result = async {
+                let cached = match cache
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("cache lock poisoned"))
+                    .and_then(|cache| cache.blob(&url))
+                {
+                    Ok(cached) => cached,
+                    Err(err) => {
+                        // Saving does not depend on the cache. Report the
+                        // problem, then fall back to a direct download.
+                        report_cache_error(&tx, &url, "reading cached image before save", &err);
+                        None
+                    }
+                };
+
+                match cached {
+                    Some(bytes) => tokio::fs::write(&dest, bytes)
+                        .await
+                        .with_context(|| format!("writing {}", dest.display())),
+                    None => client.download(&url, &dest).await.map(|_| ()),
+                }
             }
-        };
+            .await;
 
-        std::fs::write(&dest, bytes).with_context(|| format!("writing {}", dest.display()))?;
-        Ok(())
+            let update = match result {
+                Ok(()) => Update::Saved { key },
+                Err(err) => Update::Failed {
+                    key,
+                    error: err.to_string(),
+                },
+            };
+            let _ = tx.send(update);
+            ctx.request_repaint();
+        });
     }
+}
+
+fn report_cache_error(tx: &Sender<Update>, url: &str, context: &str, err: &anyhow::Error) {
+    let _ = tx.send(Update::Failed {
+        key: format!("cache:{url}"),
+        error: format!("{context}: {err}"),
+    });
+}
+
+async fn download_and_decode(
+    client: &Client,
+    cache: &Mutex<Cache>,
+    tx: &Sender<Update>,
+    url: &str,
+) -> Result<egui::ColorImage> {
+    let bytes = match client.fetch_bytes(url).await {
+        Ok(bytes) => {
+            let _ = tx.send(Update::Connectivity { online: true });
+            bytes
+        }
+        Err(err) => {
+            let _ = tx.send(Update::Connectivity { online: false });
+            return Err(err);
+        }
+    };
+
+    // Decode before caching so an invalid upstream response cannot poison the
+    // cache. Cache writes remain best-effort: the image is still usable now.
+    let image = decode(&bytes)?;
+    if let Ok(cache) = cache.lock() {
+        let _ = cache.put_blob(url, &bytes);
+    }
+    Ok(image)
 }
 
 fn decode(bytes: &[u8]) -> Result<egui::ColorImage> {
@@ -394,6 +477,60 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
+    }
+
+    /// Collect updates until all requested work reaches a terminal state.
+    fn wait_until_idle(fetcher: &mut Fetcher) -> Vec<Update> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut updates = Vec::new();
+        loop {
+            updates.extend(fetcher.poll());
+            if fetcher.inflight_count() == 0 {
+                return updates;
+            }
+            assert!(
+                std::time::Instant::now() <= deadline,
+                "background work did not finish"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    fn serve_png_once() -> (String, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/image.png", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request).unwrap();
+            let png = red_png();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                png.len()
+            )
+            .unwrap();
+            stream.write_all(png).unwrap();
+        });
+        (url, server)
+    }
+
+    fn red_png() -> &'static [u8] {
+        &[
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
+            0x00, 0x90, 0x77, 0x53, 0xde, 0x00, 0x00, 0x00, 0x0c, 0x49, 0x44, 0x41, 0x54, 0x08,
+            0xd7, 0x63, 0xf8, 0xcf, 0xc0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xdd, 0x8d,
+            0xb0, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+        ]
+    }
+
+    fn replace_blob_with_directory(cache: &Cache, url: &str) {
+        let path = cache.put_blob(url, b"cached bytes").unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(path).unwrap();
     }
 
     #[test]
@@ -515,17 +652,183 @@ mod tests {
     }
 
     #[test]
-    fn decodes_a_png_into_a_color_image() {
-        // 1x1 red PNG.
-        let png = [
-            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
-            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00,
-            0x00, 0x90, 0x77, 0x53, 0xde, 0x00, 0x00, 0x00, 0x0c, 0x49, 0x44, 0x41, 0x54, 0x08,
-            0xd7, 0x63, 0xf8, 0xcf, 0xc0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0x18, 0xdd, 0x8d,
-            0xb0, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
-        ];
+    fn failed_update_checks_clear_the_inflight_set() {
+        let dir = temp_dir("update-failure");
+        let cache = Cache::open_at(&dir, DEFAULT_CACHE_BUDGET).unwrap();
+        let client = Client::with_endpoint("http://127.0.0.1:1/").unwrap();
+        let mut fetcher = Fetcher::with_client(egui::Context::default(), cache, client).unwrap();
 
-        let img = decode(&png).unwrap();
+        fetcher.request_latest_release_from("http://127.0.0.1:1/latest");
+        let updates = wait_for_update(&mut fetcher);
+
+        assert!(
+            updates
+                .iter()
+                .any(|u| matches!(u, Update::LatestRelease(None)))
+        );
+        assert_eq!(fetcher.inflight_count(), 0);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn saving_cached_bytes_runs_as_background_work() {
+        let dir = temp_dir("save");
+        let dest = dir.join("saved.png");
+        let url = "https://x/full.png";
+        let cache = Cache::open_at(&dir, DEFAULT_CACHE_BUDGET).unwrap();
+        cache.put_blob(url, b"image bytes").unwrap();
+        let client = Client::with_endpoint("http://127.0.0.1:1/").unwrap();
+        let mut fetcher = Fetcher::with_client(egui::Context::default(), cache, client).unwrap();
+
+        fetcher.request_save_image(url, dest.clone());
+        assert_eq!(fetcher.inflight_saves(), 1);
+        let updates = wait_for_update(&mut fetcher);
+
+        assert!(updates.iter().any(|u| matches!(u, Update::Saved { .. })));
+        assert_eq!(std::fs::read(dest).unwrap(), b"image bytes");
+        assert_eq!(fetcher.inflight_count(), 0);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn failed_saves_clear_the_inflight_set() {
+        let dir = temp_dir("save-failure");
+        let url = "https://x/full.png";
+        let cache = Cache::open_at(&dir, DEFAULT_CACHE_BUDGET).unwrap();
+        cache.put_blob(url, b"image bytes").unwrap();
+        let client = Client::with_endpoint("http://127.0.0.1:1/").unwrap();
+        let mut fetcher = Fetcher::with_client(egui::Context::default(), cache, client).unwrap();
+
+        // Writing bytes over an existing directory is invalid on every target.
+        fetcher.request_save_image(url, dir.clone());
+        let updates = wait_for_update(&mut fetcher);
+
+        assert!(updates.iter().any(|u| matches!(u, Update::Failed { .. })));
+        assert_eq!(
+            fetcher.inflight_count(),
+            0,
+            "a failed save must not leave the status spinner stuck"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_cache_read_error_does_not_block_a_direct_save() {
+        let dir = temp_dir("save-cache-error");
+        let dest = dir.join("saved.png");
+        let (url, server) = serve_png_once();
+        let cache = Cache::open_at(&dir, DEFAULT_CACHE_BUDGET).unwrap();
+        replace_blob_with_directory(&cache, &url);
+        let client = Client::with_endpoint("http://127.0.0.1:1/").unwrap();
+        let mut fetcher = Fetcher::with_client(egui::Context::default(), cache, client).unwrap();
+
+        fetcher.request_save_image(&url, dest.clone());
+        let updates = wait_until_idle(&mut fetcher);
+        server.join().unwrap();
+
+        assert!(
+            updates
+                .iter()
+                .any(|u| matches!(u, Update::Failed { key, .. } if key == &format!("cache:{url}"))),
+            "the cache read error must still be surfaced"
+        );
+        assert!(updates.iter().any(|u| matches!(u, Update::Saved { .. })));
+        assert_eq!(std::fs::read(dest).unwrap(), red_png());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_cache_read_error_does_not_block_a_network_image() {
+        let dir = temp_dir("image-cache-error");
+        let (url, server) = serve_png_once();
+        let cache = Cache::open_at(&dir, DEFAULT_CACHE_BUDGET).unwrap();
+        replace_blob_with_directory(&cache, &url);
+        let client = Client::with_endpoint("http://127.0.0.1:1/").unwrap();
+        let mut fetcher = Fetcher::with_client(egui::Context::default(), cache, client).unwrap();
+
+        fetcher.request_image(&url, ImageKind::Thumbnail);
+        let updates = wait_until_idle(&mut fetcher);
+        server.join().unwrap();
+
+        assert!(
+            updates
+                .iter()
+                .any(|u| matches!(u, Update::Failed { key, .. } if key == &format!("cache:{url}"))),
+            "the cache read error must still be surfaced"
+        );
+        assert!(
+            updates.iter().any(|u| matches!(u, Update::Image { .. })),
+            "an optional cache failure must not hide a valid network image"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn corrupt_cached_images_are_removed_before_retrying() {
+        let dir = temp_dir("corrupt");
+        let url = "http://127.0.0.1:1/corrupt.png";
+        let cache = Cache::open_at(&dir, DEFAULT_CACHE_BUDGET).unwrap();
+        cache.put_blob(url, b"not an image").unwrap();
+        let client = Client::with_endpoint("http://127.0.0.1:1/").unwrap();
+        let mut fetcher = Fetcher::with_client(egui::Context::default(), cache, client).unwrap();
+
+        fetcher.request_image(url, ImageKind::Thumbnail);
+        let updates = wait_for_update(&mut fetcher);
+
+        assert!(updates.iter().any(|u| matches!(u, Update::Failed { .. })));
+        assert!(
+            fetcher.cache().lock().unwrap().blob(url).unwrap().is_none(),
+            "the bad bytes would otherwise poison every future request"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_cache_removal_error_does_not_block_the_network_retry() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = temp_dir("corrupt-removal");
+        let (url, server) = serve_png_once();
+        let cache = Cache::open_at(&dir, DEFAULT_CACHE_BUDGET).unwrap();
+        let path = cache.put_blob(&url, b"not an image").unwrap();
+        let blob_dir = path.parent().unwrap();
+        let mut permissions = std::fs::metadata(blob_dir).unwrap().permissions();
+        permissions.set_mode(0o555);
+        std::fs::set_permissions(blob_dir, permissions).unwrap();
+        let client = Client::with_endpoint("http://127.0.0.1:1/").unwrap();
+        let mut fetcher = Fetcher::with_client(egui::Context::default(), cache, client).unwrap();
+
+        fetcher.request_image(&url, ImageKind::Thumbnail);
+        let updates = wait_until_idle(&mut fetcher);
+        server.join().unwrap();
+        let mut permissions = std::fs::metadata(blob_dir).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(blob_dir, permissions).unwrap();
+
+        assert!(
+            updates
+                .iter()
+                .any(|u| matches!(u, Update::Failed { key, .. } if key == &format!("cache:{url}"))),
+            "the cleanup error must still be surfaced"
+        );
+        assert!(
+            updates.iter().any(|u| matches!(u, Update::Image { .. })),
+            "cleanup failure must not make a valid network response unusable"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn decodes_a_png_into_a_color_image() {
+        let img = decode(red_png()).unwrap();
         assert_eq!(img.size, [1, 1]);
     }
 
