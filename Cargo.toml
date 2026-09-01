@@ -7,6 +7,44 @@ name = "nasa-photo-viewer"
 version = "0.0.0"
 edition = "2024"
 
+[build-dependencies]
+# Maintained fork of `winres`, which embeds the icon and version metadata into
+# the Windows executable so Explorer and the taskbar show it.
+winresource = "0.1"
+
+# --- Packaging -------------------------------------------------------------
+# The version below is deliberately absent from these sections: `cargo deb`
+# takes it from `--deb-version` and the macOS Info.plist is rewritten after
+# bundling, both by package_release.py, so that git remains the only source.
+
+[package.metadata.bundle]
+name = "NASA Photo Viewer"
+identifier = "dev.lobantseff.nasa-photo-viewer"
+icon = ["assets/AppIcon.icns", "assets/AppIcon.png"]
+category = "public.app-category.photography"
+short_description = "Browse NASA Mars 2020 raw images"
+long_description = """
+A desktop browser for the raw images returned by NASA's Mars 2020 rover,
+Perseverance. Caches listings and images locally so browsing stays fast and
+works offline.
+"""
+
+[package.metadata.deb]
+name = "nasa-photo-viewer"
+maintainer = "Artem Lobantsev <lobantseff@gmail.com>"
+depends = "$auto"
+section = "graphics"
+priority = "optional"
+extended-description = """
+A desktop browser for the raw images returned by NASA's Mars 2020 rover, \
+Perseverance. Caches listings and images locally so browsing stays fast and \
+works offline."""
+assets = [
+    ["target/release/nasa-photo-viewer", "usr/bin/nasa-photo-viewer", "755"],
+    ["assets/nasa-photo-viewer.desktop", "usr/share/applications/nasa-photo-viewer.desktop", "644"],
+    ["assets/AppIcon.png", "usr/share/icons/hicolor/1024x1024/apps/nasa-photo-viewer.png", "644"],
+]
+
 [dependencies]
 anyhow = "1.0.104"
 directories = "6.0.0"

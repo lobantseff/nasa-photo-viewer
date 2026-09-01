@@ -1,0 +1,126 @@
+name: Release
+
+# Tags are created by ./increment_version.sh, e.g. v0.5.2
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: # build-only dry run; the release job is skipped off-tag
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false # a failure on one platform should not hide the others
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux-x86_64
+          - os: windows-latest
+            name: windows-x86_64
+          - os: macos-latest # Apple Silicon
+            name: macos-aarch64
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Both build.rs and package_release.py take the version from
+          # `git describe`; without the tags they would name the artifacts
+          # after a placeholder version.
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-${{ matrix.name }}
+          # A tag has its own cache scope that no later run can read, so saving
+          # here only competes for the repository's cache budget.
+          save-if: false
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxkbcommon-dev \
+            libwayland-dev
+
+      # --- Tools package_release.py shells out to ---
+      - name: Install cargo-deb
+        if: runner.os == 'Linux'
+        run: cargo install cargo-deb --locked
+
+      - name: Install cargo-bundle
+        if: runner.os == 'macOS'
+        run: cargo install cargo-bundle --locked
+
+      - name: Build and package
+        shell: bash
+        env:
+          PYTHONUTF8: "1" # Windows consoles default to cp1252 and choke on non-ASCII output
+        run: ./package_release.py "$PWD/dist"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    # Pushed tags only. The dispatch ref picker also lists tags, so testing the
+    # ref alone would let a dry run overwrite a published release.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the release and upload its assets
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -R dist
+
+      - name: Compose release notes
+        env:
+          TAG: ${{ github.ref_name }}
+          README: ${{ github.server_url }}/${{ github.repository }}/blob/${{ github.ref_name }}/README.md
+        run: |
+          v="${TAG#v}" # assets carry the bare version, tags carry the leading v
+          {
+            echo "## Install"
+            echo
+            echo "| Platform | Download | Then |"
+            echo "| --- | --- | --- |"
+            echo "| macOS (Apple Silicon) | \`nasa-photo-viewer-$v-macos-aarch64.tar.gz\` | Unpack and drag the app into Applications |"
+            echo "| Linux (x86_64) | \`nasa-photo-viewer-$v-linux-x86_64.tar.gz\` | Unpack, then \`sudo dpkg -i\` the bundled .deb or run \`./install.sh\` |"
+            echo "| Windows (x86_64) | \`nasa-photo-viewer-$v-windows-x86_64.zip\` | Unpack and run the .exe |"
+            echo
+            echo "These builds are unsigned. On macOS the first launch is blocked: right-click the app and choose Open, then confirm. Windows SmartScreen needs More info, then Run anyway."
+            echo
+            echo "Full instructions are in the [README]($README#installation)."
+            echo
+          } > notes.md
+          cat notes.md
+
+      - name: Create the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/**/*
+          body_path: notes.md
+          generate_release_notes: true # appends the commit list and compare link
+          fail_on_unmatched_files: true

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=NASA Photo Viewer
+Comment=Browse NASA Mars 2020 raw images
+Exec=nasa-photo-viewer
+Icon=nasa-photo-viewer
+Terminal=false
+Categories=Graphics;Viewer;Science;
+StartupWMClass=nasa-photo-viewer
+Keywords=NASA;Mars;Perseverance;photos;

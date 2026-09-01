@@ -29,11 +29,78 @@ so repeat browsing is instant and works offline.
   changing filters never waits on a slow upstream response
 - Remembers window size and last filters
 
+## Installation
+
+Download the archive for your platform from the
+[latest release](https://github.com/lobantseff/nasa-photo-viewer/releases/latest).
+
+### macOS (Apple Silicon)
+
+```bash
+tar -xzf nasa-photo-viewer-*-macos-aarch64.tar.gz
+mv "NASA Photo Viewer.app" /Applications/
+```
+
+The build is unsigned, so the first launch is blocked. Right-click the app and
+choose **Open**, then confirm; macOS remembers the decision. Opening it by
+double-click the first time gives no such option, only a refusal.
+
+If it still refuses, clear the quarantine flag:
+
+```bash
+xattr -dr com.apple.quarantine "/Applications/NASA Photo Viewer.app"
+```
+
+### Linux (x86_64)
+
+```bash
+tar -xzf nasa-photo-viewer-*-linux-x86_64.tar.gz
+cd nasa-photo-viewer-*/
+sudo dpkg -i nasa-photo-viewer_*.deb   # Debian, Ubuntu
+./install.sh                           # anything else, or to install without root
+```
+
+`install.sh` installs into `~/.local`, or into `/usr/local` when run with
+`sudo`, and `./install.sh --uninstall` reverses whichever was used.
+
+### Windows (x86_64)
+
+Unpack the `.zip` and run `nasa-photo-viewer.exe`. The build is unsigned, so
+SmartScreen intercepts it: choose **More info**, then **Run anyway**.
+
+### Building from source
+
+See [Running](#running) below.
+
+## Packaging
+
+```bash
+./package_release.py             # build and archive into dist/
+./package_release.py --install   # and install it on this machine
+```
+
+The script builds whatever the platform it runs on can produce: a `.app` on
+macOS, a `.deb` plus a portable archive on Linux, and a `.zip` on Windows.
+Releases are built by [CI](.github/workflows/release.yml) when a tag is
+pushed, so all three exist for every release.
+
+The icon is generated rather than drawn, and CI checks the committed copy
+still matches its generator:
+
+```bash
+./assets/generate_icon.py          # re-render assets/AppIcon.{png,ico,icns}
+./assets/generate_icon.py --check  # verify the committed icon is current
+```
+
 ## Running
 
 ```bash
 cargo run --release
 ```
+
+Requires a recent Rust toolchain. On Linux the GTK and X11 development
+packages listed in [.github/workflows/ci.yml](.github/workflows/ci.yml) are
+needed as well.
 
 Controls in the detail view:
 

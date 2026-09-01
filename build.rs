@@ -20,6 +20,13 @@ fn main() {
     let version = describe().unwrap_or_else(|| UNKNOWN.to_string());
     println!("cargo:rustc-env=NPV_VERSION={version}");
 
+    embed_windows_icon(&version);
+
+    // The icon is compiled into the binary and embedded into the executable,
+    // so a change to it has to trigger a rebuild.
+    println!("cargo:rerun-if-changed=assets/AppIcon.png");
+    println!("cargo:rerun-if-changed=assets/AppIcon.ico");
+
     // Rebuild when the checked-out commit, the tags, or the staged state
     // change; ordinary source edits already trigger a rebuild by themselves.
     if let Some(git) = git_dir() {
@@ -33,6 +40,38 @@ fn main() {
         if tags.exists() {
             println!("cargo:rerun-if-changed={}", tags.display());
         }
+    }
+}
+
+/// Embed the icon and version into the Windows executable, so Explorer, the
+/// taskbar and the properties dialog show them.
+///
+/// Silently does nothing anywhere else: the resource format is Windows-only.
+fn embed_windows_icon(version: &str) {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
+
+    // Windows wants four numeric fields; the git version carries a suffix it
+    // cannot represent, so only the release part is offered.
+    let numeric: String = version
+        .trim_start_matches('v')
+        .split(|c: char| !c.is_ascii_digit() && c != '.')
+        .next()
+        .unwrap_or("0.0.0")
+        .to_string();
+
+    let mut res = winresource::WindowsResource::new();
+    res.set_icon("assets/AppIcon.ico");
+    res.set("ProductName", "NASA Photo Viewer");
+    res.set("FileDescription", "Browse NASA Mars 2020 raw images");
+    res.set("ProductVersion", version);
+    res.set("FileVersion", &numeric);
+
+    if let Err(err) = res.compile() {
+        // A missing resource compiler should not stop a developer building on
+        // a machine without the Windows SDK.
+        println!("cargo:warning=could not embed the Windows icon: {err}");
     }
 }
 

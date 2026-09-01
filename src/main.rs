@@ -4,14 +4,35 @@ use anyhow::{Context, Result};
 use nasa_photo_viewer::app::App;
 use nasa_photo_viewer::cache::Cache;
 
+/// The application icon, decoded at startup for the window and dock.
+///
+/// The packaged builds carry a platform icon of their own, but a binary run
+/// straight from `cargo run` has none, and on Linux the window manager reads
+/// this rather than the desktop entry.
+fn window_icon() -> Option<egui::IconData> {
+    let decoded = image::load_from_memory(include_bytes!("../assets/AppIcon.png")).ok()?;
+    let rgba = decoded.to_rgba8();
+    let (width, height) = rgba.dimensions();
+    Some(egui::IconData {
+        rgba: rgba.into_raw(),
+        width,
+        height,
+    })
+}
+
 fn main() -> Result<()> {
     let cache = Cache::open_default().context("opening the local cache")?;
 
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1280.0, 860.0])
+        .with_min_inner_size([720.0, 480.0])
+        .with_title("NASA Photo Viewer — Perseverance");
+    if let Some(icon) = window_icon() {
+        viewport = viewport.with_icon(icon);
+    }
+
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1280.0, 860.0])
-            .with_min_inner_size([720.0, 480.0])
-            .with_title("NASA Photo Viewer — Perseverance"),
+        viewport,
         ..Default::default()
     };
 
