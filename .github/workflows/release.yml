@@ -1,10 +1,17 @@
 name: Release
 
-# Tags are created by ./increment_version.sh, e.g. v0.5.2
+# Normally reached by merging a pull request, which tags the merge commit and
+# then calls this workflow. Pushing a tag by hand does the same thing.
 on:
   push:
     tags: ["v*"]
-  workflow_dispatch: # build-only dry run; the release job is skipped off-tag
+  workflow_dispatch: # build-only dry run; nothing is published
+  workflow_call:
+    inputs:
+      tag:
+        description: Tag to build and publish, e.g. v0.5.3
+        required: true
+        type: string
 
 env:
   CARGO_TERM_COLOR: always
@@ -27,6 +34,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
+          # When called after a merge the tag exists but is not what triggered
+          # this run, so it has to be asked for by name.
+          ref: ${{ inputs.tag || github.ref }}
           # Both build.rs and package_release.py take the version from
           # `git describe`; without the tags they would name the artifacts
           # after a placeholder version.
@@ -80,9 +90,10 @@ jobs:
   release:
     name: Publish release
     needs: build
-    # Pushed tags only. The dispatch ref picker also lists tags, so testing the
-    # ref alone would let a dry run overwrite a published release.
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    # A tag, however it arrived: pushed directly, or created by the merge that
+    # called this workflow. Deliberately excludes workflow_dispatch, whose ref
+    # picker also lists tags, so a dry run cannot overwrite a real release.
+    if: inputs.tag != '' || (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/'))
     runs-on: ubuntu-latest
     permissions:
       contents: write # create the release and upload its assets
@@ -97,8 +108,8 @@ jobs:
 
       - name: Compose release notes
         env:
-          TAG: ${{ github.ref_name }}
-          README: ${{ github.server_url }}/${{ github.repository }}/blob/${{ github.ref_name }}/README.md
+          TAG: ${{ inputs.tag || github.ref_name }}
+          README: ${{ github.server_url }}/${{ github.repository }}/blob/${{ inputs.tag || github.ref_name }}/README.md
         run: |
           v="${TAG#v}" # assets carry the bare version, tags carry the leading v
           {
@@ -120,6 +131,8 @@ jobs:
       - name: Create the release
         uses: softprops/action-gh-release@v3
         with:
+          # A called run is not itself a tag event, so the tag has to be named.
+          tag_name: ${{ inputs.tag || github.ref_name }}
           files: dist/**/*
           body_path: notes.md
           generate_release_notes: true # appends the commit list and compare link

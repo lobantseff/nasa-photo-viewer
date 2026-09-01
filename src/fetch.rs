@@ -51,6 +51,9 @@ pub enum Update {
     Failed { key: String, error: String },
     /// Network reachability changed.
     Connectivity { online: bool },
+    /// GitHub reported its latest release. Only sent when the check succeeds:
+    /// being unable to reach it is the normal offline case, not news.
+    LatestRelease(crate::update::LatestRelease),
 }
 
 /// A listing served from the local cache.
@@ -291,6 +294,9 @@ impl Fetcher {
                         Update::Failed { key, .. } => {
                             self.inflight.remove(key);
                         }
+                        Update::LatestRelease(_) => {
+                            self.inflight.remove("release:latest");
+                        }
                         Update::Connectivity { .. } => {}
                     }
                     out.push(update);
@@ -299,6 +305,31 @@ impl Fetcher {
             }
         }
         out
+    }
+
+    /// Ask GitHub for the latest release, in the background.
+    ///
+    /// Deliberately quiet: a failure produces no message at all, since not
+    /// reaching GitHub says nothing about whether an update exists, and it
+    /// must not be mistaken for the image feed going offline.
+    pub fn request_latest_release(&mut self) {
+        let key = "release:latest".to_string();
+        if !self.inflight.insert(key) {
+            return;
+        }
+        self.issued += 1;
+
+        let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+        let client = Arc::clone(&self.client);
+
+        self.rt.spawn(async move {
+            if let Ok(bytes) = client.fetch_bytes(crate::update::LATEST_RELEASE_API).await
+                && let Ok(latest) = serde_json::from_slice::<crate::update::LatestRelease>(&bytes)
+            {
+                let _ = tx.send(Update::LatestRelease(latest));
+                ctx.request_repaint();
+            }
+        });
     }
 
     /// Copy a cached image to `dest`, fetching it first if necessary.

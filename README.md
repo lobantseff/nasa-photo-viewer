@@ -28,6 +28,7 @@ so repeat browsing is instant and works offline.
 - Cached results are shown immediately and refreshed in the background, so
   changing filters never waits on a slow upstream response
 - Remembers window size and last filters
+- Says when a newer release exists, once per version; switch it off in About
 
 ## Installation
 
@@ -211,10 +212,32 @@ for image in client.list_all(&query, 50).await? {
 }
 ```
 
+## Contributing and releasing
+
+`stable` is protected: changes arrive by pull request, and merging requires
+formatting, clippy, the tests on all three platforms, and the icon check to
+pass. Only merge commits are allowed, so the branch is a sequence of reviewed
+merges rather than a rewritten history.
+
+**Merging a pull request publishes a release.** The merge is tagged, and that
+tag builds and publishes all three platforms. The size of the bump comes from
+the pull request's labels:
+
+| Label | Effect |
+| --- | --- |
+| *(none)* | Patch: `v0.5.2` → `v0.5.3` |
+| `release:minor` | `v0.5.2` → `v0.6.0` |
+| `release:major` | `v0.5.2` → `v1.0.0` |
+| `no-release` | Merged without tagging or publishing |
+
+Use `no-release` for changes with nothing to ship — a typo, a CI tweak — and
+they will be included in whatever release comes next.
+
 ## Versioning
 
 The version the application reports comes from git tags, not from
-`Cargo.toml`:
+`Cargo.toml`. Releases are normally cut by merging, but the same script the
+merge uses can be run by hand:
 
 ```bash
 ./increment_version.sh            # patch: v0.5.1 -> v0.5.2

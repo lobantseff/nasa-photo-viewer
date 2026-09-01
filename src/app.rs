@@ -35,6 +35,13 @@ const STORAGE_KEY: &str = "npv_filters";
 /// bound cannot be recovered from the results.
 const LATEST_SOL_KEY: &str = "npv_latest_sol";
 
+/// The newest version the user has already been told about, so dismissing one
+/// release does not have to be repeated on every launch.
+const UPDATE_DISMISSED_KEY: &str = "npv_update_dismissed";
+
+/// Whether to look for new releases at all.
+const UPDATE_CHECK_KEY: &str = "npv_update_check";
+
 /// Back-navigation label.
 ///
 /// egui's default fonts have no arrow glyphs (U+2190 and the emoji arrows all
@@ -184,6 +191,12 @@ pub struct App {
     /// Highest sol observed, which bounds the sol slider.
     latest_sol: Option<i64>,
     about_open: bool,
+    /// A release newer than this build, once one has been found.
+    update_available: Option<crate::update::Available>,
+    update_modal_open: bool,
+    /// Newest version already dismissed; persisted.
+    update_dismissed: Option<String>,
+    update_check_enabled: bool,
     detail_content: DetailContent,
     error: Option<String>,
     serving_stale: bool,
@@ -201,6 +214,15 @@ impl App {
             .storage
             .and_then(|s| eframe::get_value::<Option<i64>>(s, LATEST_SOL_KEY))
             .flatten();
+        app.update_dismissed = cc
+            .storage
+            .and_then(|s| eframe::get_value::<Option<String>>(s, UPDATE_DISMISSED_KEY))
+            .flatten();
+        app.update_check_enabled = cc
+            .storage
+            .and_then(|s| eframe::get_value::<bool>(s, UPDATE_CHECK_KEY))
+            .unwrap_or(true);
+        app.start_update_check();
         app.prime_from_cache();
         app.request_more();
         Ok(app)
@@ -230,6 +252,10 @@ impl App {
             pending_advance: false,
             latest_sol: None,
             about_open: false,
+            update_available: None,
+            update_modal_open: false,
+            update_dismissed: None,
+            update_check_enabled: true,
             detail_content: DetailContent::default(),
             error: None,
             serving_stale: false,
@@ -350,6 +376,11 @@ impl App {
                     self.textures.insert(url, handle, tier);
                 }
                 Update::Failed { error, .. } => self.error = Some(error),
+                Update::LatestRelease(latest) => {
+                    self.update_available =
+                        crate::update::evaluate(VERSION, &latest, self.update_dismissed.as_deref());
+                    self.update_modal_open = self.update_available.is_some();
+                }
                 Update::Connectivity { .. } => {}
             }
         }
@@ -534,6 +565,65 @@ impl App {
         });
     }
 
+    /// Ask GitHub for the latest release, unless there is no point.
+    ///
+    /// A development build is deliberately excluded: it sits after some
+    /// release and may carry unreleased work, so pointing it at a download
+    /// would be telling the user to discard that.
+    fn start_update_check(&mut self) {
+        if !crate::update::should_check(self.update_check_enabled, VERSION) {
+            return;
+        }
+        self.fetcher.request_latest_release();
+    }
+
+    fn update_window(&mut self, ctx: &egui::Context) {
+        let Some(available) = self.update_available.clone() else {
+            return;
+        };
+        if !self.update_modal_open {
+            return;
+        }
+
+        let mut open = true;
+        egui::Window::new("Update available")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.heading(format!("{} is available", available.version));
+                ui.add_space(4.0);
+                ui.label(format!("You are running {VERSION}."));
+                ui.add_space(10.0);
+
+                ui.horizontal(|ui| {
+                    if ui.button("Open downloads").clicked() {
+                        ctx.open_url(egui::OpenUrl::new_tab(&available.url));
+                        // Opening the page is as good as being told: there is
+                        // no reason to raise it again for this version.
+                        self.dismiss_update();
+                    }
+                    if ui.button("Not now").clicked() {
+                        self.dismiss_update();
+                    }
+                });
+            });
+
+        // Closing with the window's own control counts as dismissal too.
+        if !open {
+            self.dismiss_update();
+        }
+    }
+
+    /// Stop offering this version, now and on future launches.
+    fn dismiss_update(&mut self) {
+        if let Some(available) = &self.update_available {
+            self.update_dismissed = Some(available.version.clone());
+        }
+        self.update_modal_open = false;
+    }
+
     fn about_window(&mut self, ctx: &egui::Context) {
         if !self.about_open {
             return;
@@ -580,6 +670,32 @@ impl App {
                         );
                         ui.end_row();
                     });
+
+                ui.add_space(8.0);
+                ui.separator();
+
+                if ui
+                    .checkbox(&mut self.update_check_enabled, "Check for updates")
+                    .on_hover_text(
+                        "Asks GitHub for the latest release once at startup. \
+                         Nothing else is sent.",
+                    )
+                    .changed()
+                    && self.update_check_enabled
+                {
+                    // Turning it back on should say something now rather than
+                    // waiting for the next launch.
+                    self.start_update_check();
+                }
+
+                if let Some(available) = self.update_available.clone() {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(format!("{} available", available.version)).weak());
+                        if ui.small_button("open").clicked() {
+                            ui.ctx().open_url(egui::OpenUrl::new_tab(&available.url));
+                        }
+                    });
+                }
 
                 ui.add_space(8.0);
                 ui.label(
@@ -1010,6 +1126,8 @@ impl eframe::App for App {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, STORAGE_KEY, &self.filters);
         eframe::set_value(storage, LATEST_SOL_KEY, &self.latest_sol);
+        eframe::set_value(storage, UPDATE_DISMISSED_KEY, &self.update_dismissed);
+        eframe::set_value(storage, UPDATE_CHECK_KEY, &self.update_check_enabled);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -1050,6 +1168,7 @@ impl App {
         self.sidebar(ui);
         self.status_bar(ui);
         self.about_window(&ctx);
+        self.update_window(&ctx);
 
         egui::CentralPanel::default().show(ui, |ui| match self.selected {
             Some(idx) if idx < self.visible_len() => self.detail(ui, idx),
@@ -1978,6 +2097,128 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    fn latest(tag: &str) -> crate::update::LatestRelease {
+        crate::update::LatestRelease {
+            tag_name: tag.to_string(),
+            html_url: Some(format!("https://example.invalid/{tag}")),
+        }
+    }
+
+    /// Put the app in the state it reaches after finding a newer release.
+    fn app_offered(tag: &str) -> (App, std::path::PathBuf) {
+        let (mut app, dir) = test_app_thumbs_only(&["A"]);
+        app.update_available = Some(crate::update::Available {
+            version: tag.to_string(),
+            url: format!("https://example.invalid/{tag}"),
+        });
+        app.update_modal_open = true;
+        (app, dir)
+    }
+
+    #[test]
+    fn the_update_notice_appears_and_can_be_dismissed() {
+        let (app, dir) = app_offered("v9.9.9");
+        let mut harness =
+            egui_kittest::Harness::new_ui_state(|ui, app: &mut App| app.ui_impl(ui), app);
+        settle(&mut harness);
+
+        assert!(harness.query_by_label("Open downloads").is_some());
+
+        harness.get_by_label("Not now").click();
+        settle(&mut harness);
+
+        assert!(!harness.state().update_modal_open);
+        // Remembered, so the next launch does not repeat itself.
+        assert_eq!(harness.state().update_dismissed.as_deref(), Some("v9.9.9"));
+        assert!(harness.query_by_label("Open downloads").is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn opening_the_downloads_page_also_dismisses_the_notice() {
+        let (app, dir) = app_offered("v9.9.9");
+        let mut harness =
+            egui_kittest::Harness::new_ui_state(|ui, app: &mut App| app.ui_impl(ui), app);
+        settle(&mut harness);
+
+        harness.get_by_label("Open downloads").click();
+        settle(&mut harness);
+
+        // Having been sent to the page, being asked again would be nagging.
+        assert_eq!(harness.state().update_dismissed.as_deref(), Some("v9.9.9"));
+        assert!(!harness.state().update_modal_open);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn no_notice_appears_when_there_is_no_newer_release() {
+        let (app, dir) = test_app_thumbs_only(&["A"]);
+        let mut harness =
+            egui_kittest::Harness::new_ui_state(|ui, app: &mut App| app.ui_impl(ui), app);
+        settle(&mut harness);
+
+        assert!(harness.query_by_label("Open downloads").is_none());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_release_report_is_judged_against_the_dismissed_version() {
+        let (mut app, dir) = test_app_thumbs_only(&["A"]);
+        app.update_dismissed = Some("v9.9.9".to_string());
+
+        // Already dismissed: nothing to say.
+        app.update_available =
+            crate::update::evaluate(VERSION, &latest("v9.9.9"), app.update_dismissed.as_deref());
+        assert!(app.update_available.is_none());
+
+        // A later one still gets through.
+        app.update_available =
+            crate::update::evaluate(VERSION, &latest("v99.0.0"), app.update_dismissed.as_deref());
+        // Only meaningful for a release build; a dev build declines either way.
+        if crate::update::is_release_build(VERSION) {
+            assert!(app.update_available.is_some());
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn switching_the_check_off_stops_it_asking() {
+        let (mut app, dir) = test_app_thumbs_only(&["A"]);
+        app.update_check_enabled = false;
+
+        let before = app.fetcher.issued_count();
+        app.start_update_check();
+
+        assert_eq!(
+            app.fetcher.issued_count(),
+            before,
+            "no request should be made"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_check_follows_the_rule_for_this_build() {
+        let (mut app, dir) = test_app_thumbs_only(&["A"]);
+        app.update_check_enabled = true;
+
+        let before = app.fetcher.issued_count();
+        app.start_update_check();
+        let issued = app.fetcher.issued_count() - before;
+
+        // Whether this build asks is decided by should_check, which is tested
+        // exhaustively of its own accord; here it only has to be obeyed.
+        let expected = u64::from(crate::update::should_check(true, VERSION));
+        assert_eq!(issued, expected);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn the_version_is_resolved_from_git_at_build_time() {
         // Rejects the placeholder a failed `git describe` falls back to, which
@@ -2478,6 +2719,10 @@ mod tests {
             "Reset",
             "waiting for the first results",
             "Cameras",
+            "Update available",
+            "Open downloads",
+            "Not now",
+            "Check for updates",
             "About",
             "NASA Photo Viewer",
             "About this application",

@@ -1,0 +1,79 @@
+name: Release on merge
+
+# Every merge into stable is a release, unless the pull request carried the
+# `no-release` label. The size of the bump comes from the labels too, so the
+# decision is visible on the pull request rather than buried in a commit
+# message.
+on:
+  pull_request:
+    types: [closed]
+    branches: [stable]
+
+# Two merges in quick succession would otherwise both read the same latest tag
+# and try to create it.
+concurrency:
+  group: release-on-merge
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    name: Tag the merge
+    if: >-
+      github.event.pull_request.merged == true &&
+      !contains(github.event.pull_request.labels.*.name, 'no-release')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create and push the tag
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The merge commit itself, which is what the tag should name.
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          # increment_version.sh reads the latest tag reachable from HEAD.
+          fetch-depth: 0
+
+      - name: Decide the size of the bump
+        id: bump
+        env:
+          # A JSON array; matching on the quoted name avoids `release:minor`
+          # also matching a label that merely contains it.
+          LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: |
+          part=patch
+          if grep -q '"release:major"' <<<"$LABELS"; then
+            part=major
+          elif grep -q '"release:minor"' <<<"$LABELS"; then
+            part=minor
+          fi
+          echo "Labels: $LABELS"
+          echo "Bump: $part"
+          echo "part=$part" >> "$GITHUB_OUTPUT"
+
+      - name: Create and push the tag
+        id: tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # The same script used by hand, so the version arithmetic has one
+          # implementation rather than a second copy in YAML.
+          ./increment_version.sh "${{ steps.bump.outputs.part }}" --push
+
+          # Now the newest tag reachable from here.
+          tag="$(git describe --tags --abbrev=0)"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Tagged $tag"
+
+  release:
+    name: Release
+    needs: tag
+    # Called rather than left to the tag push: a tag pushed with GITHUB_TOKEN
+    # deliberately does not trigger other workflows, which is what would
+    # otherwise require a personal access token to be stored here.
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.tag.outputs.tag }}
+    permissions:
+      contents: write
