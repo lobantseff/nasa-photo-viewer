@@ -20,7 +20,7 @@ jobs:
     name: Format and lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -61,7 +61,7 @@ jobs:
           - os: macos-latest
             name: macos
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # build.rs derives the version from `git describe`, and a shallow
           # clone carries no tags, so it would silently report a placeholder.
@@ -92,9 +92,13 @@ jobs:
     name: Icon is reproducible
     runs-on: macos-latest # iconutil, needed for the .icns, exists only here
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@v10.0.1 # no moving major tag is published; pin exact
+        with:
+          # The generator declares its dependencies inline and there is no lock
+          # file to key a cache on.
+          enable-cache: false
 
       - name: Check the committed icon matches its generator
         run: ./assets/generate_icon.py --check

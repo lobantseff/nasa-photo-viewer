@@ -1419,6 +1419,22 @@ mod tests {
         harness.run_steps(8);
     }
 
+    /// Run until no request is outstanding.
+    ///
+    /// Requests against the refused port fail quickly, but how quickly is the
+    /// platform's business, so tests that care about a *new* request have to
+    /// wait rather than assume.
+    fn drain(harness: &mut egui_kittest::Harness<'_, App>) {
+        for _ in 0..400 {
+            if harness.state().fetcher.inflight_count() == 0 {
+                return;
+            }
+            settle(harness);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("requests never drained");
+    }
+
     /// Hover over the middle of the image area, below the toolbar.
     fn hover_image_area(harness: &mut egui_kittest::Harness<'_, App>) -> egui::Pos2 {
         let toolbar = harness.get_by_label("Fit").rect();
@@ -2124,6 +2140,13 @@ mod tests {
         settle(&mut harness);
         harness.get_by_label("C").click();
         settle(&mut harness);
+
+        // Let the gallery's own page request finish first. Requests are
+        // de-duplicated by key, so an identical one still in flight would
+        // absorb the press being tested and the count would not move. How
+        // long that takes depends on how quickly the platform refuses the
+        // connection, which is why this cannot be assumed.
+        drain(&mut harness);
 
         let before = harness.state().fetcher.issued_count();
         harness.key_press(egui::Key::ArrowRight);
