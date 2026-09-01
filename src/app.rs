@@ -634,7 +634,12 @@ impl App {
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            // Opens centred but stays draggable. An anchor would re-pin it
+            // every frame, so it could not be moved off whatever it covers.
+            .pivot(egui::Align2::CENTER_CENTER)
+            .default_pos(ctx.content_rect().center())
+            // Dragging it fully off screen would leave no way to reach it.
+            .constrain(true)
             .show(ctx, |ui| {
                 ui.heading("NASA Photo Viewer");
                 ui.label(RichText::new(VERSION).weak());
@@ -2324,6 +2329,55 @@ mod tests {
         // come from, which is the whole point of opening it.
         assert!(harness.query_by_label("NASA Photo Viewer").is_some());
         assert!(harness.query_by_label("NASA/JPL-Caltech").is_some());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_about_window_can_be_dragged_somewhere_else() {
+        let (mut app, dir) = test_app_thumbs_only(&["A"]);
+        app.about_open = true;
+
+        let mut harness =
+            egui_kittest::Harness::new_ui_state(|ui, app: &mut App| app.ui_impl(ui), app);
+        settle(&mut harness);
+
+        let before = harness.get_by_label("NASA Photo Viewer").rect();
+
+        // Grab the title bar and move it. An anchored window would be pinned
+        // back to the same place every frame, so nothing would change.
+        //
+        // Done by hand rather than with drag_at/drop_at, which only press and
+        // release: egui derives the drag from the movement in between, so
+        // without a PointerMoved the window never travels.
+        // The accessible node covers the whole window, and by default only the
+        // title bar drags it, so aim near the top edge rather than the middle.
+        let window = harness.get_by_label("About").rect();
+        let from = egui::pos2(window.center().x, window.min.y + 10.0);
+        let to = from + egui::vec2(-120.0, -60.0);
+
+        harness.event(egui::Event::PointerButton {
+            pos: from,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        });
+        settle(&mut harness);
+        harness.event(egui::Event::PointerMoved(to));
+        settle(&mut harness);
+        harness.event(egui::Event::PointerButton {
+            pos: to,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        settle(&mut harness);
+
+        let after = harness.get_by_label("NASA Photo Viewer").rect();
+        assert_ne!(
+            before.min, after.min,
+            "the About window did not move when dragged"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
